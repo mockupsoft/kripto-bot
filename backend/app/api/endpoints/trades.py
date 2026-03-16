@@ -75,6 +75,11 @@ async def list_trades(
     total_open   = (await db.execute(total_open_q)).scalar()   or 0
     total_closed = (await db.execute(total_closed_q)).scalar() or 0
 
+    # Last position opened at (for "no new trades" diagnostic)
+    last_opened_q = select(func.max(PaperPosition.opened_at)).select_from(PaperPosition)
+    last_opened = (await db.execute(last_opened_q)).scalar()
+    last_position_opened_at = last_opened.scalar().isoformat() if last_opened.scalar() else None
+
     # Fetch page
     q = base.order_by(PaperPosition.opened_at.desc()).limit(limit).offset(offset)
     result = await db.execute(q)
@@ -103,6 +108,7 @@ async def list_trades(
         "total": total,
         "total_open": total_open,
         "total_closed": total_closed,
+        "last_position_opened_at": last_position_opened_at,
         "limit": limit,
         "offset": offset,
         "strategies": strategies,

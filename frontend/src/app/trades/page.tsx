@@ -29,6 +29,7 @@ interface TradesResponse {
   total: number;
   total_open: number;
   total_closed: number;
+  last_position_opened_at: string | null;
   limit: number;
   offset: number;
   strategies: string[];
@@ -174,23 +175,44 @@ export default function TradesPage() {
 
       {/* Summary bar */}
       {data && (
-        <div className="grid grid-cols-4 gap-3">
-          {[
-            { label: 'Toplam', value: data.total, color: 'text-white' },
-            { label: 'Açık',   value: openCount,  color: 'text-blue-400' },
-            { label: 'Kapandı', value: closedCount, color: 'text-gray-300' },
-            {
-              label: 'Sayfa PnL',
-              value: (totalPnl >= 0 ? '+' : '') + '$' + Math.abs(totalPnl).toFixed(4),
-              color: totalPnl >= 0 ? 'text-green-400' : 'text-red-400',
-            },
-          ].map(s => (
-            <div key={s.label} className="rounded-xl border border-white/5 bg-surface-raised px-4 py-3">
-              <p className="text-xs text-gray-500">{s.label}</p>
-              <p className={`text-lg font-bold ${s.color}`}>{s.value}</p>
+        <>
+          <div className="grid grid-cols-4 gap-3">
+            {[
+              { label: 'Toplam', value: data.total, color: 'text-white' },
+              { label: 'Açık',   value: openCount,  color: 'text-blue-400' },
+              { label: 'Kapandı', value: closedCount, color: 'text-gray-300' },
+              {
+                label: 'Sayfa PnL',
+                value: (totalPnl >= 0 ? '+' : '') + '$' + Math.abs(totalPnl).toFixed(4),
+                color: totalPnl >= 0 ? 'text-green-400' : 'text-red-400',
+              },
+            ].map(s => (
+              <div key={s.label} className="rounded-xl border border-white/5 bg-surface-raised px-4 py-3">
+                <p className="text-xs text-gray-500">{s.label}</p>
+                <p className={`text-lg font-bold ${s.color}`}>{s.value}</p>
+              </div>
+            ))}
+          </div>
+          {/* Son işlem açılışı — "23:06'dan sonra işlem yok" teşhisi */}
+          {data.last_position_opened_at && (
+            <div className="mt-2 flex flex-wrap items-center gap-2 rounded-lg bg-white/5 px-3 py-2 text-xs">
+              <span className="text-gray-500">Son işlem açılışı:</span>
+              <span className="font-mono text-gray-300">{fmtDate(data.last_position_opened_at)}</span>
+              {(() => {
+                const lastMs = new Date(data.last_position_opened_at).getTime();
+                const minAgo = (Date.now() - lastMs) / 60000;
+                if (minAgo > 30) {
+                  return (
+                    <span className="text-amber-400">
+                      ({(minAgo < 60 ? Math.round(minAgo) : Math.round(minAgo / 60))}{minAgo < 60 ? ' dk' : ' saat'} önce — yeni işlem yok. Analytics / Strategy Health veya backend loglarına bakın.)
+                    </span>
+                  );
+                }
+                return null;
+              })()}
             </div>
-          ))}
-        </div>
+          )}
+        </>
       )}
 
       {/* Filters */}
