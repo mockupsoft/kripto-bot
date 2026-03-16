@@ -1,0 +1,74 @@
+---
+description: Proje genel mimarisi, DEMO_MODE_ONLY güvenlik kuralları ve katman yapısı
+alwaysApply: true
+---
+
+# Kripto-Bot — Proje Mimarisi ve Güvenlik Kuralları
+
+## DEMO_MODE_ONLY — Mutlak Kural
+
+Bu sistem **sadece paper trading (simülasyon)** amaçlıdır. Gerçek para işlemi ASLA yapılmaz.
+
+```python
+# backend/app/config.py — her zaman kontrol et
+DEMO_MODE_ONLY = True  # Bu değer False yapılamaz
+
+# Gerçek order gönderilecek herhangi bir kod yazılırsa BU ŞEKILDE engelle:
+if not settings.DEMO_MODE_ONLY:
+    raise RuntimeError("Real order execution is disabled in this system.")
+```
+
+## Katman Yapısı
+
+```
+Polymarket API
+    ↓
+ingestion/          # Ham veri: raw_events → wallet_transactions, market_snapshots
+    ↓
+intelligence/       # Wallet scoring, tracking, alpha, influence graph
+    ↓
+signals/            # Signal generation, signal_filter (FilterResult)
+    ↓
+strategies/         # runner.py → direct_copy, high_conviction, leader_copy, dislocation
+    ↓
+execution/          # paper_executor.py (SADECE simülasyon)
+    ↓
+analytics/          # PnL, metrics, strategy health
+    ↓
+api/endpoints/      # FastAPI REST endpoints
+```
+
+## Servis Portları
+
+| Servis | Port |
+|--------|------|
+| Backend (FastAPI) | 8002 (host) → 8000 (container) |
+| Frontend (Next.js) | 3002 (host) → 3000 (container) |
+| PostgreSQL | 5432 |
+| Redis | 6379 |
+
+## Başlangıç Bankroll
+
+- Başlangıç: **$900 USD** (paper)
+- Max pozisyon: bankroll'un %8'i
+- Max toplam exposure: %20
+- Max consecutive loss kill-switch: 15
+
+## Stratejiler
+
+| Strateji | Açıklama | Varsayılan Mod |
+|----------|----------|----------------|
+| `direct_copy` | Tüm tracked wallet'ları kopyala | active |
+| `high_conviction` | Composite score > 0.5 olanları kopyala | active |
+| `leader_copy` | Sadece influence graph leader'larını kopyala | active |
+| `dislocation` | Market fiyat anomalilerini yakala | shadow |
+| `shadow` | Sadece izle, trade etme | shadow |
+
+## Dosya Değişikliği Kuralı
+
+Windows Docker bind mount senkronizasyon sorunu vardır. Herhangi bir dosya değişikliğinde:
+```
+docker cp backend/app/xyz/file.py kripto-bot-backend-1:/app/app/xyz/file.py
+docker exec kripto-bot-backend-1 sh -c "find /app -name '__pycache__' -type d | xargs rm -rf 2>/dev/null"
+```
+Kalıcı değişiklik için: `docker compose build --no-cache backend`

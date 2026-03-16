@@ -1,0 +1,137 @@
+---
+description: Frontend Next.js/TypeScript standartları, API çağrı patterns, component kuralları
+globs: frontend/**/*.{ts,tsx}
+alwaysApply: false
+---
+
+# Frontend Next.js/TypeScript Standartları
+
+## API Base URL
+
+```typescript
+// ✅ DOĞRU
+const API = "http://localhost:8002/api";
+
+// Tüm fetch çağrıları try/catch ile sarılmalı
+const data = await fetch(`${API}/analytics/metrics`).then(r => r.json());
+```
+
+## Tip Tanımlamaları
+
+```typescript
+// Her API response için interface tanımla
+interface WalletEntry {
+  wallet_id: string;
+  address: string;
+  composite_score: number | null;
+  copyable_alpha_score?: number;
+  alpha_decay_risk?: "low" | "medium" | "high" | "critical";
+  copy_recommendation?: "copy_now" | "monitor" | "avoid";
+  latency_decay?: {
+    "200ms": number;
+    "500ms": number;
+    "1000ms": number;
+    "1500ms": number;
+  };
+}
+```
+
+## Encoding / Karakter Kuralı
+
+```typescript
+// ✅ DOĞRU — ASCII semboller kullan
+const verdictIcon = result.verdict === "TRADEABLE" ? "OK" : "NO";
+const multiplier = `${val.toFixed(2)}x`;
+
+// ❌ YANLIŞ — UTF-8 özel karakterler bozulabilir (Windows)
+const icon = "✓";   // → "âœ"" olarak görünebilir
+const cross = "✕";  // → "âœ•" olarak görünebilir
+const times = "×";  // → "Ã—" olarak görünebilir
+```
+
+## Polling Pattern (Canlı Veri)
+
+```typescript
+// useEffect ile otomatik yenileme
+useEffect(() => {
+  loadData();  // İlk yükleme
+  const interval = setInterval(loadData, 30_000);  // 30 sn
+  return () => clearInterval(interval);
+}, []);
+```
+
+## İstanbul Saati Gösterimi
+
+```typescript
+// Tüm tarihler Istanbul timezone'unda gösterilmeli
+const formatTime = (iso: string) =>
+  new Date(iso).toLocaleString("tr-TR", {
+    timeZone: "Europe/Istanbul",
+    dateStyle: "short",
+    timeStyle: "medium",
+  });
+```
+
+## Sayfa Yapısı
+
+```
+frontend/src/app/
+  page.tsx              → Overview (bakiye, pozisyonlar, sistem sağlığı)
+  trades/page.tsx       → Simüle işlemler (pagination + live)
+  wallets/page.tsx      → Wallet leaderboard + drawer
+  markets/page.tsx      → Market monitor + actionability
+  signals/page.tsx      → Signal feed (pagination + live)
+  analytics/page.tsx    → Equity curve, strategy health, metrics
+  research/page.tsx     → Research Lab (experiment, wallet intel, alpha backtest)
+  settings/page.tsx     → Risk profili, strategy parametreleri
+```
+
+## Pagination Standartı
+
+```typescript
+// Trades ve Signals sayfaları için standart pagination
+const [page, setPage] = useState(0);  // 0-indexed
+const PAGE_SIZE = 50;
+
+// offset = page * PAGE_SIZE
+const data = await fetch(`${API}/trades?limit=${PAGE_SIZE}&offset=${page * PAGE_SIZE}&hide_zero_pnl=true`)
+  .then(r => r.json());
+// Response: { total, limit, offset, strategies, exit_reasons, trades[] }
+```
+
+## Trades API Filtreler
+
+```
+GET /api/trades?limit=50&offset=0
+  &status=open|closed
+  &strategy=direct_copy|high_conviction|leader_copy|dislocation
+  &exit_reason=market_resolved|stop_loss|target_hit
+  &hide_zero_pnl=true   # realized_pnl=0 olan closed pozisyonları gizle
+```
+
+## Drawer / Modal Pattern
+
+```typescript
+// Wallet detail drawer
+const [selected, setSelected] = useState<WalletEntry | null>(null);
+
+// Drawer açık olduğunda alpha + decay fetch
+useEffect(() => {
+  if (!selected) return;
+  fetchAlphaDetail(selected.wallet_id);
+  fetchDecayDetail(selected.wallet_id);
+}, [selected?.wallet_id]);
+```
+
+## Önemli Endpoint Yolları
+
+| Endpoint | Açıklama |
+|----------|----------|
+| `GET /api/wallets/intelligence/alpha-leaderboard` | Alpha score sıralaması |
+| `GET /api/wallets/intelligence/influence-graph` | Leader/follower graph |
+| `GET /api/wallets/{id}/alpha` | Tek wallet 6-faktör breakdown |
+| `GET /api/wallets/{id}/alpha-decay` | Wallet decay analizi |
+| `GET /api/markets/actionability` | Tradeable market listesi |
+| `GET /api/analytics/strategy-health` | Strategy rolling metrics |
+| `GET /api/analytics/alpha-backtest` | 5-bucket IQ testi |
+| `GET /api/analytics/daily-digest` | Günlük özet |

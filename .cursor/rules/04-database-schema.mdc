@@ -1,0 +1,106 @@
+---
+description: Veritabanı şeması, SQLAlchemy model kuralları, kolon tipleri ve bilinen sorunlar
+globs: backend/app/models/**/*.py
+alwaysApply: false
+---
+
+# Veritabanı Şeması ve SQLAlchemy Kuralları
+
+## Kritik Kolon Tipleri
+
+Overflow'a neden olan kolonlara dikkat et:
+
+```python
+# ✅ DOĞRU — wallet_scores
+max_drawdown = mapped_column(Numeric(16, 4))  # max_drawdown 23000+ olabilir!
+total_roi    = mapped_column(Numeric(12, 6))
+
+# ❌ YANLIŞ — overflow riski
+max_drawdown = mapped_column(Numeric(10, 6))  # 9999.999999 sınırı → crash!
+```
+
+```python
+# ✅ DOĞRU — wallet_transactions
+outcome = mapped_column(String(255))  # "Kamilla rakhimova" gibi uzun isimler
+
+# ❌ YANLIŞ — kısa string
+outcome = mapped_column(String(8))   # StringDataRightTruncation!
+```
+
+## Ana Tablolar ve İlişkiler
+
+```
+wallets (id, address, is_tracked, label)
+  └── wallet_transactions (wallet_id→wallets, market_id→markets, occurred_at, detected_at)
+  └── wallet_scores (wallet_id→wallets, composite_score, max_drawdown, copy_decay_curve)
+
+markets (id, condition_id, polymarket_id, question, slug, token_ids JSONB)
+  └── market_snapshots (market_id→markets, midpoint, spread, best_bid, best_ask)
+  └── market_relationships (market1_id, market2_id, relationship_type, z_score)
+
+trade_signals (id, market_id, source_wallet_id, raw_edge, net_edge, strategy)
+  └── signal_decisions (signal_id, decision, reason, proposed_size)
+
+paper_positions (id, market_id, source_wallet_id, strategy, status, realized_pnl)
+  └── position_events (position_id, event_type, price, size)
+```
+
+## Market Linking Kuralı
+
+`wallet_transactions.market_id` çoğu zaman NULL gelir. Bu **normal** — ingestion sırasında
+Polymarket'ten `conditionId` geliyor ama bu `conditionId` bizim `markets` tablomuzda olmayabilir.
+
+**Çözüm:** `_ensure_market_exists()` fonksiyonu on-demand Gamma API fetch yapar:
+
+```python
+# live_ingestion.py içinde — her transaction için:
+mkt = await _ensure_market_exists(db, condition_id, slug=slug)
+if mkt:
+    market_id = mkt.id
+```
+
+## `source_sequence_id` ile Deduplication
+
+```python
+# Aynı tx_hash'i iki kez ekleme:
+dup = await db.execute(
+    select(WalletTransaction).where(
+        WalletTransaction.source_sequence_id == tx_hash
+    )
+)
+if dup.scalar_one_or_none():
+    continue
+```
+
+## Zaman Alanı Kuralları
+
+Her modelde iki zaman alanı olmalı:
+
+```python
+occurred_at: datetime   # Polymarket'te gerçek işlem zamanı
+detected_at: datetime   # Bizim sistemimizin gördüğü zaman (now())
+detection_lag_ms: int   # (detected_at - occurred_at) * 1000
+```
+
+**Önemli:** `detect_new_trades()` `occurred_at` ile filtreler (eski: `detected_at` kullanıyordu → hata!).
+
+## Alembic Migration
+
+```powershell
+# Yeni migration oluştur
+docker exec kripto-bot-backend-1 alembic revision --autogenerate -m "add xyz column"
+
+# Migration uygula
+docker exec kripto-bot-backend-1 alembic upgrade head
+```
+
+## Acil Kolon Düzeltmesi (Migration Gerektirmeden)
+
+```sql
+-- max_drawdown overflow fix
+ALTER TABLE wallet_scores ALTER COLUMN max_drawdown TYPE NUMERIC(16,4);
+
+-- outcome truncation fix
+ALTER TABLE wallet_transactions ALTER COLUMN outcome TYPE VARCHAR(255);
+ALTER TABLE wallet_transactions ALTER COLUMN side TYPE VARCHAR(32);
+```

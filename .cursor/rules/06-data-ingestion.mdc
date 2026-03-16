@@ -1,0 +1,109 @@
+---
+description: Veri ingestion — market linking, wallet tracking, on-demand discovery kuralları
+globs: backend/app/ingestion/**/*.py
+alwaysApply: false
+---
+
+# Veri Ingestion Kuralları
+
+## Market Linking Problemi
+
+Polymarket Data API'den gelen wallet işlemlerinde `conditionId` var ama bu ID bizim
+`markets` tablomuzda olmayabilir. Bu yüzden işlemlerin `market_id` alanı NULL kalır.
+
+**Çözüm:** `_ensure_market_exists()` — on-demand Gamma API fetch:
+
+```python
+# live_ingestion.py içinde wallet transaction işlenirken:
+condition_id = trade.get("conditionId", "")
+asset_id     = trade.get("asset", "")
+slug         = trade.get("slug", "")
+
+# 3 adımlı arama + 1 fallback:
+# Try 1: condition_id exact match
+# Try 2: polymarket_id match
+# Try 3: token_ids JSONB içinde asset_id arama
+# Try 4: _ensure_market_exists(db, condition_id, slug) → Gamma API fetch
+```
+
+## Wallet Transaction Zaman Filtresi
+
+```python
+# ✅ DOĞRU — detect_new_trades occurred_at kullanmalı
+q = q.where(WalletTransaction.occurred_at > since)
+q = q.order_by(WalletTransaction.occurred_at.desc())
+
+# ❌ ESKİ (düzeltildi) — detected_at kullanmak yanlıştı
+# Çünkü ingestion saatler önce yapılmış olabilir
+# detected_at: biz ne zaman gördük (sistemin zamanı)
+# occurred_at: Polymarket'te ne zaman oldu (gerçek zaman)
+```
+
+## Market Limit
+
+```python
+# ✅ DOĞRU — daha fazla market çek
+async def ingest_live_markets(limit: int = 200) -> int:
+    markets = await fetch_live_markets(limit=limit)
+
+# ❌ ESKİ — 50 limit çok azdı, wallet'ların işlem yaptığı marketleri kapsayamıyordu
+# Sonuç: 88 market → linked transaction yok → 0 signal
+```
+
+## Ingestion Cycle Sırası
+
+```
+run_live_ingestion_cycle()
+  1. ingest_live_markets(limit=200)        # ~200 Polymarket marketi çek
+  2. _refresh_relationship_market_snapshots()  # ilişki çifti snapshot'larını güncelle
+  3. ingest_wallet_activity(address) x N   # her tracked wallet için trade çek
+     - deduplication: source_sequence_id (tx_hash) ile
+     - market linking: 4 adımlı + on-demand discovery
+     - raw_event store: her işlemi ham olarak sakla
+  4. process_pending_events()              # raw → normalize
+  5. discover_profitable_wallets()         # yeni wallet keşfi
+  6. rescore_active_wallets()              # wallet puanlama
+```
+
+## Deduplication
+
+```python
+tx_hash = trade.get("transactionHash") or trade.get("id") or ""
+if tx_hash:
+    dup = await db.execute(
+        select(WalletTransaction).where(
+            WalletTransaction.source_sequence_id == tx_hash
+        )
+    )
+    if dup.scalar_one_or_none():
+        continue  # Zaten var
+```
+
+## Wallet Auto-Discovery
+
+```python
+# Polymarket'in public trade stream'inden yeni wallet'ları otomatik keşfet
+# discovery.py — en az 5 trade, belirli ROI eşiği üstü walletları is_tracked=True yap
+```
+
+## Supervisor Loop (main.py)
+
+```python
+# start_live_polling crash ederse otomatik yeniden başla
+async def _supervised_polling():
+    delay = 5
+    while True:
+        try:
+            await start_live_polling()
+        except Exception as e:
+            logger.error(f"Polling crashed: {e}. Restarting in {delay}s...")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 120)  # exponential backoff, max 2 dk
+```
+
+## Rate Limit
+
+- Gamma API: makul aralıklarla polling
+- `REQUEST_DELAY = 0.3` saniye aralar
+
+Wallet başına max `20` trade per çekme (deduplication ile yönetilir).

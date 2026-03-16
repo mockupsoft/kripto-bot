@@ -1,0 +1,106 @@
+---
+description: Backend Python/FastAPI kodlama standartları, import kuralları, async patterns
+globs: backend/**/*.py
+alwaysApply: false
+---
+
+# Backend Python/FastAPI Standartları
+
+## Import Kuralları
+
+```python
+# ✅ DOĞRU — signals modülü
+from app.signals.signal_filter import FilterResult, SignalFilter
+
+# ❌ YANLIŞ — strategies içinde signal_filter yok
+from app.strategies.signal_filter import SignalFilter  # ModuleNotFoundError!
+```
+
+**Kritik import yolları:**
+- Signal filter: `app.signals.signal_filter`
+- Paper executor: `app.execution.paper_executor`
+- Position sizer: `app.risk.position_sizer`
+- Wallet tracker: `app.intelligence.wallet_tracker`
+- Signal generator: `app.signals.signal_generator`
+
+## FilterResult Kullanımı
+
+```python
+# FilterResult attribute'ları:
+result.decision   # "accept" | "reject" | "shadow"
+result.reason     # str
+result.edge_at_decision  # float
+
+# ✅ DOĞRU kontrol
+if filter_result.decision != "accept":
+    return None
+
+# ❌ YANLIŞ — passed attribute YOK
+if not filter_result.passed:   # AttributeError!
+    return None
+```
+
+## TradeSignal Model Field Adları
+
+```python
+# ✅ DOĞRU
+signal.source_wallet_id   # wallet UUID
+
+# ❌ YANLIŞ — bu field yok
+signal.wallet_id          # AttributeError!
+```
+
+## BaseStrategy Abstract Metotları
+
+Her strateji sınıfı **hem** `evaluate` **hem** `execute` implement etmek zorunda:
+
+```python
+class MyStrategy(BaseStrategy):
+    name = "my_strategy"
+
+    async def evaluate(self, db, signal, current_price, current_spread,
+                       available_depth, book_levels, bankroll, exposure_pct):
+        ...
+
+    async def execute(self, db, signal, decision, book_levels, book_snapshot_id):
+        # Minimum implementation:
+        if decision.decision != "accept":
+            return None
+        return await execute_paper_trade(db=db, ...)
+```
+
+## Async DB Session Kuralları
+
+```python
+# ✅ DOĞRU — her task kendi session'ını açar
+async with async_session_factory() as db:
+    result = await db.execute(...)
+    await db.commit()
+
+# ❌ YANLIŞ — session'ı fonksiyonlar arasında paylaşma
+# flush sonrası exception gelirse session geçersizleşir
+```
+
+## Duplicate Local Import Bug
+
+```python
+# ✅ DOĞRU — bir kez global import
+from app.signals.signal_filter import FilterResult
+
+# ❌ YANLIŞ — fonksiyon içinde tekrar import etme
+async def evaluate(...):
+    from app.signals.signal_filter import FilterResult  # UnboundLocalError!
+    result = FilterResult(...)
+```
+
+## Logging
+
+```python
+import logging
+logger = logging.getLogger(__name__)
+
+# structlog da kullanılabilir:
+import structlog
+logger = structlog.get_logger()
+logger.info("cycle complete", trades=5)
+```

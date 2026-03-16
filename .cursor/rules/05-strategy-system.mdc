@@ -1,0 +1,157 @@
+---
+description: Strateji sistemi — runner, kill-switch, signal filter, bankroll allocation kuralları
+globs: backend/app/strategies/**/*.py
+alwaysApply: false
+---
+
+# Strateji Sistemi Kuralları
+
+## Runner Cycle Akışı
+
+```
+runner.run_cycle(db)
+  1. process_pending_events()       # raw_events → domain tables
+  2. check_kill_switch()            # consecutive REAL loss > 15 → dur
+                                    # NOT: stale_data / cleanup exitler sayılmaz
+  3. score_and_persist() per wallet # wallet puanla
+  4. get_strategy_bankroll()        # PF-bazlı sermaye dağılımı
+                                    # NOT: bankroll = 0 → shadow/kill, sinyal yok
+  5. detect_new_trades() per wallet # son 2 dk occurred_at filtresi
+     → market_id IS NOT NULL filtresi (linked trades only)
+     → WalletScore'dan w_composite çek (Bayesian için)
+     → for each tx[:2]: signal üret → strategy.evaluate() → strategy.execute()
+  6. dislocation signals            # MarketRelationship bazlı
+  7. exit_engine.run()              # açık pozisyonları kontrol et
+  8. compute_portfolio_snapshot()   # PnL snapshot
+```
+
+## Kill Switch
+
+Kill switch aktif olduğunda runner ERKEN ÇIKAR — hiç sinyal üretilmez:
+
+```python
+# ✅ Mevcut eşikler (kill_switch.py)
+consecutive_loss_limit = 15   # (eski: 5 → tüm işlemleri durduruyordu!)
+daily_loss_stop_pct    = 0.20  # günlük %20 kayıp
+
+# Kill switch aktif mi?
+kill = await check_kill_switch(db)
+if kill.is_active:
+    return stats  # Sinyal üretimi yok!
+```
+
+**Teşhis:** `signals_generated: 0` ise ilk kontrol: kill switch durumu:
+```python
+stats = await runner.run_cycle(db)
+if 'kill_switch' in stats:
+    print(stats['kill_switch'])  # "consecutive_losses: 10 >= 15"
+```
+
+## Strategy Manager — Sermaye Dağılımı
+
+```python
+# strategy_manager.py
+MAX_STRATEGY_SHARE = 0.60    # Tek strateji max %60 bankroll alabilir
+DEFAULT_CONFIGS = {
+    "direct_copy":     {"default_mode": "active", "min": 0.10, "max": 0.50},
+    "high_conviction": {"default_mode": "active", "min": 0.10, "max": 0.50},
+    "leader_copy":     {"default_mode": "active", "min": 0.05, "max": 0.45},
+    "dislocation":     {"default_mode": "shadow",  "min": 0.05, "max": 0.30},
+}
+
+# Otomatik kill-switch: PF < 0.8 (son 20 trade) → shadow mode
+# Otomatik restore: PF >= 1.1 → active mode
+
+# KRITIK: Rolling stats hesabında NON_TRADING_EXITS filtrelenmeli!
+# stale_data / position_cap_cleanup exitler PF = 0 yapar → strateji yanlışlıkla shadow olur → bankroll = 0 → trades_executed = 0
+NON_TRADING_EXITS = {"stale_data", "position_cap_cleanup", "demo_cleanup"}
+
+# get_rolling_stats() sorgusunda ZORUNLU:
+select(PaperPosition).where(
+    PaperPosition.strategy == strategy,
+    PaperPosition.status == "closed",
+    PaperPosition.exit_reason.notin_(NON_TRADING_EXITS),  # ← BU OLMADAN BOZULUR
+)
+```
+
+## Yeni Strateji Ekleme Checklist
+
+```python
+# 1. BaseStrategy'den türet
+class MyStrategy(BaseStrategy):
+    name = "my_strategy"  # runner.py'de bu isimle kayıtlı olmalı
+
+    # 2. evaluate() implement et
+    async def evaluate(self, db, signal, current_price, current_spread,
+                       available_depth, book_levels, bankroll, exposure_pct):
+        if bankroll <= 0:
+            return None  # shadow/paused
+        # ... logic ...
+        return SignalDecision(action="BUY", size=..., price=...)
+
+    # 3. execute() implement et — ZORUNLU (abstract)
+    async def execute(self, db, signal, decision, book_levels, book_snapshot_id):
+        if decision.decision != "accept":
+            return None
+        return await execute_paper_trade(db=db, strategy=self.name, ...)
+
+# 4. runner.py'de kaydet:
+self.strategies["my_strategy"] = MyStrategy()
+copy_strategies = [..., "my_strategy"]
+
+# 5. strategy_manager.py'de default config ekle:
+"my_strategy": {"default_mode": "active", "min": 0.05, "max": 0.40, ...}
+```
+
+## Bayesian Sinyal Besleme — Wallet Score Kullanımı
+
+Spot feed olmadan `model_probability` daima `0.5` kalır → edge = 0 → Kelly = 0 → size = 0 → trades_executed = 0.
+
+**Çözüm:** Wallet'ın `composite_score` değeri Bayesian sinyali olarak kullanılır:
+
+```python
+# signal_generator.generate_copy_signal() içinde — ZORUNLU
+# wallet_score parametresi runner'dan WalletScore tablosundan çekilmeli
+effective_book_imbalance = (wallet_score - 0.5) * 2    # [−1, 1]
+effective_repricing      = max(0.0, (wallet_score - 0.4) * 1.5)
+estimate = estimator.update(
+    spot_move_direction=spot_move,          # spot feed gelince buraya bağlanır
+    order_book_imbalance=effective_book_imbalance,
+    repricing_speed=effective_repricing,
+)
+
+# runner.py'de — WalletScore tablosundan çek, w.composite_score KULLANMA (wallets tablosunda yok):
+ws_result = await db.execute(
+    select(WalletScore).where(WalletScore.wallet_id == w.id)
+    .order_by(WalletScore.scored_at.desc()).limit(1)
+)
+ws = ws_result.scalar_one_or_none()
+w_composite = float(ws.composite_score or 0.5) if ws else 0.5
+signal = await self.signal_gen.generate_copy_signal(..., wallet_score=w_composite)
+```
+
+**DİKKAT:** `Wallet` modeli (wallets tablosu) `composite_score` sütunu içermez.
+`composite_score` → `wallet_scores` tablosunda, `WalletScore` modeli üzerinden erişilir.
+
+## Alpha Decay Kill-Switch (Wallet Bazlı)
+
+```python
+# runner.py — her wallet için
+decay = await detect_alpha_decay(db, w.id)
+if decay.get("decay_alert") and decay.get("reason") != "insufficient_data":
+    decay_skip_strategies = {"leader_copy", "high_conviction"}
+else:
+    decay_skip_strategies = set()
+```
+
+## Evaluate Error Handling
+
+Strategy evaluate hataları tüm cycle'ı durdurmamalı:
+
+```python
+try:
+    decision = await strat.evaluate(...)
+except Exception as eval_err:
+    logger.warning(f"{strat_name} evaluate error: {eval_err}")
+    decision = None
+```

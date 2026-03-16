@@ -1,0 +1,105 @@
+---
+description: Docker container yönetimi, Windows bind mount sorunu ve deployment rehberi
+globs: docker-compose.yml
+alwaysApply: false
+---
+
+# Docker / Deployment Kuralları
+
+## Windows Bind Mount Sorunu — KRİTİK
+
+Windows'ta Docker bind mount **gerçek zamanlı dosya sync yapmaz**. `docker compose restart` sonrasında eski Python kodu çalışmaya devam edebilir.
+
+### Güvenilir Dosya Güncelleme Akışı
+
+```powershell
+# 1. Dosyayı host'ta düzelt
+# 2. Container'a zorla kopyala
+docker cp backend/app/xyz/file.py kripto-bot-backend-1:/app/app/xyz/file.py
+
+# 3. Eski .pyc cache'i temizle
+docker exec kripto-bot-backend-1 sh -c "find /app -name '__pycache__' -type d | xargs rm -rf 2>/dev/null"
+
+# 4. Import test et
+docker exec kripto-bot-backend-1 python3 -c "from app.xyz.file import MyClass; print('ok')"
+```
+
+### Kalıcı Değişiklik için Rebuild
+
+```powershell
+# Tüm değişiklikleri image'a bake-in et
+docker compose build --no-cache backend
+docker compose up -d backend
+```
+
+## Container Startup Command
+
+`docker-compose.yml` backend komutu bu sırayla çalışır:
+
+```yaml
+command: >
+  sh -c "find /app -name '__pycache__' -type d | xargs rm -rf 2>/dev/null;
+         alembic upgrade head &&
+         python -m app.seed.run_seed;
+         python -m uvicorn app.main:app --host 0.0.0.0 --port 8000"
+```
+
+**Önemli:** `pycache` temizleme startup'ta otomatik yapılıyor.
+
+## Restart Politikası
+
+Tüm servisler `restart: unless-stopped` ile çalışmalı:
+```yaml
+services:
+  backend:
+    restart: unless-stopped
+    environment:
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+```
+
+## Hata Teşhis Komutları
+
+```powershell
+# Son log satırları
+docker logs kripto-bot-backend-1 2>&1 | Select-Object -Last 20
+
+# Belirli hata arama
+docker logs kripto-bot-backend-1 2>&1 | Select-String "error|failed|exception" | Select-Object -Last 10
+
+# Cycle istatistikleri
+docker logs kripto-bot-backend-1 2>&1 | Select-String "cycle|signals_generated|trades_executed" | Select-Object -Last 5
+
+# Container durumu
+docker ps --filter "name=kripto-bot" --format "{{.Names}}: {{.Status}}"
+```
+
+## Crash Loop Tespiti
+
+```powershell
+# Container sürekli restart ediyorsa:
+docker logs kripto-bot-backend-1 2>&1 | Select-Object -Last 30
+# ImportError veya Traceback ara
+# En yaygın sebepler:
+# 1. ImportError — dosya sync gecikmesi → docker cp ile kopyala
+# 2. NumericValueOutOfRangeError — DB column overflow → ALTER TABLE
+# 3. abstract method not implemented — BaseStrategy eksik metot
+```
+
+## DB Schema Düzeltme (Prod)
+
+```powershell
+# Container içinde psql ile kolon tipi değiştir
+docker exec kripto-bot-postgres-1 psql -U polybot -d polybot -c \
+  "ALTER TABLE wallet_scores ALTER COLUMN max_drawdown TYPE NUMERIC(16,4);"
+```
+
+## Polled Servis Sağlık Kontrolü
+
+```powershell
+# Backend API sağlıklı mı?
+Invoke-RestMethod http://localhost:8002/api/analytics/metrics
+
+# Canlı cycle çalışıyor mu? (signals_generated > 0 olmalı)
+docker logs kripto-bot-backend-1 2>&1 | Select-String "signals_generated" | Select-Object -Last 1
+```

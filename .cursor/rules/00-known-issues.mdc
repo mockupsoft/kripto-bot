@@ -1,0 +1,326 @@
+---
+description: Bilinen hatalar, teşhis rehberi ve sık karşılaşılan sorunların çözümleri
+alwaysApply: true
+---
+
+# Bilinen Sorunlar ve Çözümler
+
+## 1. `signals_generated: 0` — Sıfır Sinyal
+
+En sık karşılaşılan sorun. Teşhis adımları:
+
+```python
+# Adım 1: Kill switch aktif mi?
+stats = await runner.run_cycle(db)
+if 'kill_switch' in stats:
+    print(stats['kill_switch'])
+    # Çözüm: kill_switch.py'de consecutive_loss_limit artır (şu an: 15)
+
+# Adım 2: Wallet'ların linked trade'i var mı?
+docker exec kripto-bot-postgres-1 psql -U polybot -d polybot -c \
+  "SELECT COUNT(*) FROM wallet_transactions WHERE market_id IS NOT NULL AND occurred_at > NOW() - INTERVAL '10 minutes';"
+# 0 gelirse: on-demand market discovery çalışmıyor
+
+# Adım 3: detect_new_trades occurred_at mı kullanıyor?
+# wallet_tracker.py:  q.where(WalletTransaction.occurred_at > since)  ← DOĞRU
+# (eski: detected_at → tüm işlemler "eskimiş" görünüyordu)
+```
+
+## 2. `ImportError: cannot import name 'ingest_wallet_activity'`
+
+```
+Sebep: live_ingestion.py'de fonksiyon tanımı eksik veya eski .pyc yükleniyor
+Çözüm:
+  1. docker cp live_ingestion.py container:/app/app/ingestion/
+  2. docker exec container sh -c "find /app -name '__pycache__' -type d | xargs rm -rf 2>/dev/null"
+  3. docker compose build --no-cache backend  (kalıcı çözüm)
+```
+
+## 3. `'TradeSignal' object has no attribute 'wallet_id'`
+
+```
+Sebep: TradeSignal modeli wallet_id değil source_wallet_id kullanıyor
+Çözüm: signal.wallet_id → signal.source_wallet_id
+```
+
+## 4. `'FilterResult' object has no attribute 'passed'`
+
+```
+Sebep: FilterResult.decision kullanılmalı, passed attribute yok
+Çözüm:
+  filter_result.passed             → filter_result.decision == "accept"
+  if not filter_result.passed:     → if filter_result.decision != "accept":
+```
+
+## 5. `Can't instantiate abstract class without execute`
+
+```
+Sebep: BaseStrategy'nin execute() abstract metodu implement edilmemiş
+Çözüm: Her strateji sınıfına execute() ekle (direct_copy.py'den kopyala)
+```
+
+## 6. `NumericValueOutOfRangeError: NUMERIC(10,6)`
+
+```
+Sebep: wallet_scores.max_drawdown 23000+ değer alıyor, Numeric(10,6) max ~9999
+Çözüm:
+  ALTER TABLE wallet_scores ALTER COLUMN max_drawdown TYPE NUMERIC(16,4);
+  # Model dosyasında da: Numeric(10, 6) → Numeric(16, 4)
+```
+
+## 7. `StringDataRightTruncationError: VARCHAR(8)`
+
+```
+Sebep: wallet_transactions.outcome için "Kamilla rakhimova" gibi uzun değer
+Çözüm:
+  ALTER TABLE wallet_transactions ALTER COLUMN outcome TYPE VARCHAR(255);
+  ALTER TABLE wallet_transactions ALTER COLUMN side TYPE VARCHAR(32);
+```
+
+## 8. Duplicate Local Import — `UnboundLocalError`
+
+```python
+# YANLIŞ: Hem global hem local import
+from app.signals.signal_filter import FilterResult  # global
+
+async def evaluate(...):
+    from app.signals.signal_filter import FilterResult  # local → UnboundLocalError!
+    result = FilterResult(...)
+
+# DOĞRU: Sadece global import kullan
+```
+
+## 9. Windows Volume Mount Gecikmesi
+
+```
+Sebep: Docker Desktop for Windows'ta bind mount gerçek zamanlı sync yapmaz
+Belirti: Dosya düzeltildi ama container eski kodu çalıştırmaya devam ediyor
+Çözüm:
+  docker cp file.py container:/app/app/...
+  docker exec container sh -c "find /app -name '__pycache__' -type d | xargs rm -rf 2>/dev/null"
+  docker compose build --no-cache backend  (kalıcı)
+```
+
+## 10. Container Crash Loop
+
+```
+Belirti: docker ps → "Restarting (1) X seconds ago"
+Teşhis: docker logs kripto-bot-backend-1 2>&1 | Select-Object -Last 30
+En yaygın sebepler:
+  - ImportError (#2 yukarıda)
+  - DB migration hatası: alembic upgrade head başarısız
+  - Syntax error yeni dosyada
+```
+
+## 11. `trades_executed: 0` — Sinyaller Var Ama Trade Açılmıyor
+
+Bu en sinsi hata — log'da her şey normal görünür ama hiç pozisyon açılmaz.
+Beş ayrı katmanda tetiklenebilir; **sırayla kontrol et**:
+
+### 11a. Strategy-level kill-switch: `stale_data` exitler kayıp sayılıyor
+```sql
+-- Son 20 exit'in kaçı gerçek trading, kaçı altyapı temizliği?
+SELECT exit_reason, COUNT(*) FROM paper_positions
+WHERE status='closed' ORDER BY closed_at DESC LIMIT 20;
+-- stale_data / position_cap_cleanup yoğunsa → strategy PF = 0 → shadow mode → bankroll = 0
+```
+
+**KURAL:** `strategy_manager.get_rolling_stats()` yalnızca gerçek trading
+exit'lerini saymalı. `stale_data`, `position_cap_cleanup`, `demo_cleanup`
+exit türleri hem `kill_switch.py` hem `strategy_manager.py` içinde filtrelenmeli:
+
+```python
+# kill_switch.py ve strategy_manager.py'de ZORUNLU filtre
+NON_TRADING_EXITS = {"stale_data", "position_cap_cleanup", "demo_cleanup", "market_resolved"}
+MIN_REAL_LOSS = -0.005  # $0.005 altı gürültü sayılır, kayıp sayılmaz
+
+# kill_switch.py — sadece gerçek trading exitlerini say:
+trading_exits = [p for p in recent if (p.exit_reason or "") not in NON_TRADING_EXITS]
+consecutive = 0
+for p in trading_exits:
+    if float(p.realized_pnl or 0) < MIN_REAL_LOSS:
+        consecutive += 1
+    else:
+        break
+
+# strategy_manager.py — rolling stats sorgusuna filtre ekle:
+.where(PaperPosition.exit_reason.notin_(NON_TRADING_EXITS))
+```
+
+### 11b. ENV değişkeni `docker-compose.yml`'deki hardcoded değeri override eder
+```yaml
+# docker-compose.yml — env var kod default'unu GEÇERSIZ KILAR
+- MIN_CONF_EDGE=0.012   # kod içinde 0.005 yazan değer bu yüzden etkisiz kalır
+```
+Kod değişikliği yapınca `docker-compose.yml`'deki env satırını da güncelle.
+Sonra `docker compose up -d --force-recreate backend` ile ENV'i al.
+
+### 11c. Kelly yönü: BUY/SELL taraf gözetilmeli
+```python
+# position_sizer.py — YANLIŞ: side farkı gözetilmiyor
+payoff_ratio = (1 - market_price) / max(market_price, 0.01)
+kelly_size(win_probability=model_probability, ...)
+# BUY'da prob < price → Kelly negatif → size = 0
+
+# DOĞRU: side'a göre flip et
+if side == "SELL":
+    win_prob = 1.0 - model_probability
+    price = 1.0 - market_price
+else:
+    win_prob = model_probability
+    price = market_price
+payoff_ratio = (1 - price) / max(price, 0.01)
+kelly_size(win_probability=win_prob, ...)
+```
+
+### 11d. Bayesian'a sıfır sinyal beslenince `model_probability = 0.5` kalır
+```python
+# signal_generator.generate_copy_signal() çağrısında
+# spot_move=0, volatility=0, book_imbalance=0 geçilirse
+# Bayesian prior = Beta(2,2) → mean = 0.5 → edge = 0 → Kelly = 0 → size = 0
+
+# ÇÖZÜM: wallet_score'u sinyal olarak kullan
+effective_book_imbalance = (wallet_score - 0.5) * 2   # [−1, 1]
+effective_repricing      = max(0.0, (wallet_score - 0.4) * 1.5)
+estimate = estimator.update(
+    order_book_imbalance=effective_book_imbalance,
+    repricing_speed=effective_repricing,
+    ...
+)
+# runner.py'de: wallet_score=w_composite (WalletScore tablosundan çek)
+```
+
+### 11e. `proposed_size = 0.0` — signal_decisions tablosundan doğrula
+```sql
+SELECT ts.side, ROUND(ts.model_probability::numeric,4) as prob,
+       ROUND(ts.market_price::numeric,4) as price,
+       ROUND(sd.proposed_size::numeric,4) as size, sd.decision
+FROM trade_signals ts
+JOIN signal_decisions sd ON sd.signal_id = ts.id
+WHERE ts.created_at > NOW()-INTERVAL '5 minutes'
+ORDER BY ts.created_at DESC LIMIT 10;
+-- size = 0.0000 → Kelly = 0 → execute_paper_trade açılmaz (actual_size = 0)
+-- EK: bankroll=0 (shadow/paused) stratejiler için de size=0+accept oluşur
+-- ÇÖZÜM: runner'da bankroll<=0 stratejileri evaluate()'den önce atla
+```
+
+### 11f. SELL sinyallerinin tamamı reject — `conf_edge_low` negatif
+```python
+# signal_filter.py — YANLIŞ: signed raw_edge SELL'de negatif
+edge_at_decision = raw_edge - abs(price_drift) - spread/2
+# SELL için raw_edge = model_prob - market_price = 0.50 - 0.86 = -0.36 → conf_edge negatif → reject
+
+# DOĞRU: abs() ile yön bağımsız hale getir
+edge_at_decision = abs(raw_directional) - abs(price_drift) - current_spread / 2
+```
+
+### Hızlı Teşhis Sırası
+```
+1. signals_generated: 0  → kill switch veya strategy kill switch aktif
+2. signals_generated: X  → reject nedenlerine bak (signal_decisions tablosu)
+3. accept: X var ama trades_executed: 0  → proposed_size = 0 (Kelly/bankroll sorunu)
+4. proposed_size > 0 ama trades_executed: 0  → execute() içinde hata var
+5. SELL accept = 0 ama BUY accept > 0  → signal_filter'da edge abs() yok (SELL için negatif)
+6. accept var, proposed_size > 0, ama trades = 0  → bankroll=0 strateji evaluate'e giriyor
+```
+
+## 12. `'KellyResult' object has no attribute 'recommended_size'`
+
+```
+Sebep: KellyResult dataclass'ında 'recommended_size' alanı yok, doğru alan adı 'proposed_size_usd'
+Çözüm:
+  sizing.recommended_size → sizing.proposed_size_usd
+  (kelly.py: KellyResult.proposed_size_usd = round(proposed_usd, 2))
+```
+
+## 13. `'action' is an invalid keyword argument for SignalDecision`
+
+```
+Sebep: SignalDecision modeli 'action' field'ı kabul etmiyor.
+Doğru alanlar: decision, reject_reason, proposed_size, kelly_fraction, ...
+Çözüm: SignalDecision(action=...) → SignalDecision(decision="accept", ...)
+```
+
+## 14. `max_exposure_exceeded: 409.00% > 12%`
+
+```
+Sebep: check_exposure() içinde total_bankroll = 0 geçiliyor
+  → current_exposure_pct = total_exposure / max(0, 1) = total_exposure * 100
+Çözüm: get_strategy_bankroll() 0 döndürüyorsa signal_filter'da exposure gate
+  atlanmalı VEYA runner'da bankroll > 0 kontrolü yapılmalı.
+  
+signal_filter.py'de:
+  if current_bankroll > 0 and current_exposure_pct > 0.12:  # sıfır bankroll = güvenli pass
+      return reject(...)
+```
+
+## Sistem Sağlık Kontrol Komutu
+
+```powershell
+# Tek komutla tam durum özeti
+docker logs kripto-bot-backend-1 2>&1 | Select-String "cycle|runner|ImportError|Traceback" | Select-Object -Last 5
+Invoke-RestMethod http://localhost:8002/api/analytics/metrics
+
+# trades_executed: 0 teşhisi
+docker exec kripto-bot-postgres-1 psql -U polybot -d polybot -c "
+SELECT reject_reason, COUNT(*) FROM signal_decisions
+WHERE decided_at > NOW()-INTERVAL '5 minutes' AND decision='reject'
+GROUP BY reject_reason ORDER BY COUNT(*) DESC LIMIT 10;"
+
+docker exec kripto-bot-postgres-1 psql -U polybot -d polybot -c "
+SELECT ROUND(sd.proposed_size::numeric,4) as size, sd.decision, COUNT(*)
+FROM signal_decisions sd WHERE sd.decided_at > NOW()-INTERVAL '5 minutes'
+GROUP BY sd.proposed_size, sd.decision LIMIT 5;"
+```
+
+## 15. `leader_copy evaluate error: 'action' is an invalid keyword argument for SignalDecision`
+
+```
+Sebep: leader_copy.py evaluate() metodu SignalDecision(action="BUY", ...) şeklinde
+  ham DB modeli oluşturmaya çalışıyordu. SignalDecision modelinde 'action' alanı yok.
+  
+Çözüm: evaluate() şunları yapmalı:
+  1. self._filter.evaluate() ile FilterResult al
+  2. compute_position_size() ile sizing hesapla  
+  3. self._filter.record_decision() ile DB'ye kaydet ve return et
+  
+  Yanlış pattern:
+    return SignalDecision(action="BUY", size=..., ...)
+  
+  Doğru pattern (direct_copy'den kopyala):
+    decision = await self._filter.record_decision(
+        db=db, signal=signal, result=filter_result,
+        kelly_fraction=sizing.capped_fraction,
+        proposed_size=sizing.proposed_size_usd,
+        available_bankroll=bankroll,
+        current_exposure_pct=exposure_pct,
+    )
+    return decision
+```
+
+## 16. Edge Calibration — Temel Bulgular (Mar 2026, n=83)
+
+```
+pearson_r (overall) = -0.10  →  uncalibrated
+BUY r  = -0.37  →  inverted  (yüksek edge BUY trades kaybediyor!)
+SELL r = +0.64  →  calibrated (SELL edge iyi çalışıyor, ama küçük örneklem)
+
+Edge bucket analizi:
+  low_edge  (< 0.05): avg_pnl = -$0.0022  (n=24)
+  mid_edge  (0.05-0.15): avg_pnl = +$0.1835  (n=17)  ← en iyi bucket
+  high_edge (> 0.15): avg_pnl = -$0.0505  (n=42)  ← en kötü bucket!
+
+High-edge miss rate: 31/38 = 81.6%
+→ Yüksek edge tahmin edilen trade'lerin %81'i kaybediyor
+
+Muhtemel nedenler:
+  1. Model edge'i Bayesian wallet_score'dan alıyor (circular logic riski)
+  2. wallet_reversal exit çok agresif olabilir (31 yüksek edge trade'de 2'si wallet_reversal)
+  3. Gerçek bilgi sinyali yok (spot feed eksik) → edge tahmini gürültü
+
+Aksiyon:
+  - Spot feed entegrasyonu öncelik (Binance/external)
+  - Mid-edge bucket'ı filtre olarak değerlendir
+  - Edge calibration endpoint: GET /api/analytics/edge-calibration
+```
+

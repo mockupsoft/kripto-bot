@@ -1,0 +1,132 @@
+---
+description: Wallet Intelligence — copyable alpha score, influence graph, decay detector kuralları
+globs: backend/app/intelligence/**/*.py
+alwaysApply: false
+---
+
+# Wallet Intelligence Sistemi
+
+## Copyable Alpha Score — 6 Faktör
+
+```python
+# wallet_alpha.py — compute_copyable_alpha()
+copyable_alpha_score = (
+    timing_score          * 0.22 +  # Fiyat hareket etmeden önce trade ediyor mu?
+    persistence_score     * 0.18 +  # Alpha tutarlı mı, şans mı?
+    vol_adjusted_roi      * 0.20 +  # Sharpe-benzeri risk-adjusted getiri
+    latency_survivability * 0.18 +  # 800ms copy lag'de edge hala pozitif mi?
+    drawdown_stability    * 0.12 +  # Arada patlama var mı?
+    information_impact    * 0.10    # Trade'ler fiyatı etkiliyor mu?
+)  # Toplam ağırlık = 1.00
+```
+
+## Copy Recommendation Mantığı
+
+```python
+# alpha_decay_risk + copyable_alpha_score kombinasyonu
+if alpha_score >= 0.55 and decay_risk in ("low", "medium"):
+    recommendation = "copy_now"
+elif alpha_score >= 0.35 and decay_risk != "critical":
+    recommendation = "monitor"
+else:
+    recommendation = "avoid"
+```
+
+## Wallet Influence Graph
+
+```python
+# build_influence_graph(db, max_lag_seconds=300)
+# Leader: diğer wallet'ların kendisinden sonra aynı yönde trade ettiği wallet
+# Follower: leader'dan sonra trade eden wallet
+
+# Edge ağırlığı:
+weight = 0.4 * agree_rate + 0.35 * lag_norm + 0.25 * price_move_norm
+
+# InfluenceEdge fields:
+edge.leader_wallet_id
+edge.follower_wallet_id
+edge.weight              # 0-1
+edge.observation_count
+edge.avg_lag_seconds
+edge.min_lag_seconds
+edge.max_lag_seconds
+edge.avg_price_move      # leader→follower arası fiyat değişimi
+```
+
+## Alpha Decay Detector
+
+```python
+# detect_alpha_decay(db, wallet_id) → dict
+{
+    "decay_alert": True/False,
+    "reason": "pf_declining | insufficient_data | stable",
+    "pf_10": float,   # Son 10 trade profit factor
+    "pf_20": float,   # Son 20 trade profit factor
+    "pf_40": float,   # Son 40 trade profit factor
+    "trend": "declining | stable | improving"
+}
+```
+
+## Alpha Decay Kill-Switch Entegrasyonu
+
+```python
+# runner.py — wallet bazlı filtre
+decay = await detect_alpha_decay(db, wallet.id)
+if decay.get("decay_alert") and decay.get("reason") != "insufficient_data":
+    # high_conviction ve leader_copy bu wallet için çalışmaz
+    decay_skip_strategies = {"leader_copy", "high_conviction"}
+    # direct_copy hâlâ çalışır (daha toleranslı)
+```
+
+## Alpha Backtest (5-Bucket IQ Testi)
+
+```python
+# /api/analytics/alpha-backtest endpoint
+# Tüm wallet'ları alpha_score'a göre 5 eşit gruba böl (quintile)
+# Her grup için paper trade PnL'ini ölç
+# Beklenen: üst bucket > alt bucket (monotonic artış)
+
+# Validation verdict:
+# "VALID: alpha score predicts performance"  → Üst bucket açık kazanıyor
+# "WEAK: limited predictive power"          → Ortalama fark küçük
+# "INVALID: no correlation"                  → Dağınık, korelasyon yok
+```
+
+## Leader Copy Strategy — Giriş Kriterleri
+
+```python
+# leader_copy.py — 4 gate
+
+# Gate 1: Influence graph'ta leader mı?
+is_leader = wallet_id in graph.leaders
+influence_score = graph.influence_scores.get(wallet_id, 0.0)
+if not is_leader and influence_score < 0.40:
+    return None
+
+# Gate 2: Alpha score yeterli mi?
+if alpha.copyable_alpha_score < 0.35:
+    return None
+if alpha.alpha_decay_risk == "critical":
+    return None
+
+# Gate 3: Standard signal filter (net_edge > 0)
+filter_result = await self._filter.evaluate(db=db, signal=signal, ...)
+if filter_result.decision != "accept":
+    return None
+
+# Gate 4: Kelly × confidence sizing (leader bonus %10)
+conf_factor = min(1.0, conf_factor * 1.10)
+```
+
+## Wallet Graph Cache
+
+```python
+# leader_copy.py — module level cache
+_cached_graph = None
+_cache_time: datetime | None = None
+_GRAPH_TTL_MINUTES = 60  # Saatlik yeniden hesapla
+
+async def _get_influence_graph(db):
+    # TTL dolmadıysa cache'den döndür
+    # TLL dolduysa build_influence_graph() çağır
+```

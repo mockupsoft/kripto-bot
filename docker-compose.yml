@@ -1,0 +1,105 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-polybot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-polybot_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-polybot}
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U polybot"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8002:8000"
+    env_file:
+      - .env
+    environment:
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+      # Risk / position limits — tunable without rebuild
+      - MAX_OPEN_POSITIONS=30
+      - MAX_POSITIONS_PER_WALLET=3
+      # Cost regime filters — primary gate for cost/gross ratio
+      - MIN_CONF_EDGE=0.005
+      - MAX_SPREAD_TO_EDGE=0.6
+      - MAX_SPREAD_ABS=0.08
+      - MIN_DEPTH_USD=100.0
+      # Dislocation strategy thresholds
+      - DISLO_MIN_Z=2.0
+      - DISLO_MIN_EDGE=0.01
+      - DISLO_MIN_DEPTH=50.0
+      - DISLO_MAX_SPREAD=0.15
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: >
+      sh -c "find /app -name '__pycache__' -type d | xargs rm -rf 2>/dev/null; alembic upgrade head && python -m app.seed.run_seed; python -m uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # In Docker, Redis is the service name (not localhost)
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: >
+      sh -c "python -m app.worker"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "3002:3000"
+    env_file:
+      - .env
+    environment:
+      - BACKEND_INTERNAL_URL=http://backend:8000
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    command: npm run dev -- --hostname 0.0.0.0
+
+volumes:
+  pgdata:

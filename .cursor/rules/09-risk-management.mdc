@@ -1,0 +1,166 @@
+---
+description: Risk yönetimi — position sizing, Kelly criterion, exposure manager kuralları
+globs: backend/app/risk/**/*.py
+alwaysApply: false
+---
+
+# Risk Yönetimi Kuralları
+
+## Kill Switch Parametreleri
+
+```python
+# kill_switch.py — mevcut eşikler
+consecutive_loss_limit = 15    # (eski: 5 → çok agresifti, sistemi kilitledi)
+daily_loss_stop_pct    = 0.20  # Günlük %20 kayıp → dur
+
+# KRITIK: stale_data ve cleanup exitler SAYILMAZ — bunlar sinyal kalitesini yansıtmaz
+NON_TRADING_EXITS = {"stale_data", "position_cap_cleanup", "demo_cleanup", "market_resolved"}
+MIN_REAL_LOSS = -0.005   # $0.005 altı gürültü sayılır, gerçek kayıp değil
+
+# Sadece trading exitlerini say:
+trading_exits = [p for p in recent if (p.exit_reason or "") not in NON_TRADING_EXITS]
+consecutive = 0
+for p in trading_exits:
+    if float(p.realized_pnl or 0) < MIN_REAL_LOSS:
+        consecutive += 1
+    else:
+        break
+
+# Kill switch aktifse runner ERKEN ÇIKAR:
+kill = await check_kill_switch(db)
+if kill.is_active:
+    stats["kill_switch"] = kill.reason
+    return stats  # Signal üretimi yok!
+```
+
+## Cost Regime — Ana Kapı (PRIMARY GATE)
+
+Ana sorun: cost/gross ratio > 1.0 → spread + fee edge'i silip götürüyor.
+
+```python
+# signal_filter.py — env ile ayarlanabilir
+MIN_CONF_EDGE          = 0.005   # confidence_adjusted_edge minimum (0.012'den düşürüldü — spot feed olmadan Bayesian prior = 0.5 → edge küçük kalır)
+MAX_SPREAD_TO_EDGE     = 0.60    # spread_cost / edge ≤ 0.6 (spread edge'in %60'ından fazlasını yiyemez)
+MAX_SPREAD_ABS         = 0.08    # mutlak spread üst sınırı
+MIN_DEPTH_USD          = 100.0   # minimum order book derinliği (USD)
+
+# DİKKAT: docker-compose.yml'deki MIN_CONF_EDGE env satırı kod default'unu override eder!
+# Kod değişikliği yapınca docker-compose.yml'i de güncelle:
+#   - MIN_CONF_EDGE=0.005   (eski: 0.012 → çok sıkıydı, trades_executed=0 yapıyordu)
+
+# Hedef: cost/gross ratio < 1.0
+# Gate sırası: staleness → spread_abs → conf_edge → spread_to_edge → net_edge → liquidity → exposure → concentration
+```
+
+## Exposure / Position Limits
+
+```python
+# exposure_manager.py — env ile ayarlanabilir
+MAX_OPEN_POSITIONS_GLOBAL   = 30   # Sistem genelinde max açık pozisyon
+MAX_OPEN_POSITIONS_PER_WALLET = 3  # Wallet başına max açık pozisyon
+
+max_total_exposure_pct  = 0.12  # Bankroll'un %12'si (eski: %20)
+max_correlated_positions = 1    # Aynı market'ta max 1 pozisyon (eski: 2)
+max_position_pct        = 0.04  # Trade başına %4 (eski: %8)
+
+# check_exposure artık wallet_id de alıyor:
+exposure = await check_exposure(db, market_id, 50, bankroll, wallet_id=w.id)
+```
+
+## Fractional Kelly Sizing
+
+```python
+# position_sizer.py
+# KRITIK: side parametresi ZORUNLU — BUY ve SELL için farklı Kelly hesabı
+if side == "SELL":
+    win_prob = 1.0 - model_probability   # NO tarafını satın alıyoruz
+    price    = 1.0 - market_price
+else:
+    win_prob = model_probability
+    price    = market_price
+payoff_ratio = (1 - price) / max(price, 0.01)
+
+effective_kelly = kelly_fraction * confidence_factor
+# kelly_fraction = 0.25 (tam Kelly değil, güvenli %25'i)
+# confidence_factor = staleness_haircut × slippage_haircut × depth_haircut
+
+# YANLIŞ: side kullanmadan → BUY'da prob < price ise Kelly negatif → size = 0
+# DOĞRU: her zaman compute_position_size(..., side=signal.side or "BUY") ile çağır
+```
+
+## Confidence Factor Bileşenleri
+
+```python
+# markets/actionability endpoint hesabı
+confidence_factor = (
+    staleness_factor  *  # Snapshot ne kadar güncel? (eski → düşük)
+    slippage_factor   *  # Slippage riski var mı?
+    depth_factor         # Order book derinliği yeterli mi?
+)
+
+# confidence_adjusted_edge = raw_edge × confidence_factor
+# Bu, net_edge'den daha gerçekçidir
+```
+
+## Strategy Bankroll Allocation
+
+```python
+# strategy_manager.py
+# Her stratejinin max sermaye payı:
+MAX_STRATEGY_SHARE = 0.60   # %60 üstüne çıkamaz
+
+# Rolling PF-bazlı otomatik ağırlıklandırma:
+# PF > 1.0 → daha fazla sermaye
+# PF < 0.8 → shadow mode (bankroll = 0)
+# PF >= 1.1 → shadow'dan active'e dön
+```
+
+## Exit Engine Limitleri
+
+```python
+# exit_engine.py
+MAX_HOLD_HOURS       = 4    # 4 saat sonra zorla kapat (eski: 48h — çok uzundu)
+STOP_LOSS_PCT        = 0.15  # %15 kayıpta kapat
+TARGET_PCT           = 0.15  # %15 kârda kapat
+STALE_SNAPSHOT_HOURS = 2    # 2 saat snapshot yoksa kapat (eski: 6h)
+```
+
+## Runner Entry Penceresi
+
+```python
+# runner.py
+since_cutoff = timedelta(minutes=2)   # (eski: 10dk → stale sinyaller)
+new_trades[:2]                         # Wallet başına max 2 trade/cycle (eski: 5)
+```
+
+## Dislocation Filtre Parametreleri
+
+```python
+# Configurable via env vars
+MIN_Z_SCORE    = float(os.getenv("DISLO_MIN_Z",     "2.0"))
+MIN_CONF_EDGE  = float(os.getenv("DISLO_MIN_EDGE",  "0.01"))
+MIN_DEPTH_USD  = float(os.getenv("DISLO_MIN_DEPTH", "50.0"))
+MAX_SPREAD_PCT = float(os.getenv("DISLO_MAX_SPREAD","0.15"))
+```
+
+## Risk Profilleri (Güncel)
+
+| Parametre | Değer | Açıklama |
+|---|---|---|
+| Max global pozisyon | 30 | Sistem geneli hard cap |
+| Max wallet pozisyon | 3 | Per-wallet soft cap |
+| Max exposure | %12 | Bankroll yüzdesi |
+| Max position | %4 | Trade başı |
+| Max spread | 0.08 | Absolute cap |
+| Min conf edge | 0.005 | Quality gate (spot feed olmadan düşük tutulmalı) |
+| Max spread/edge | 0.60 | Cost ratio gate |
+| Hold time | 2h | Max açık kalma |
+| Stop loss | %8 | (eski: %15 — binary market için çok genişti) |
+| Target | %8 | (eski: %15) |
+
+## Cost/Gross Ratio Hedefi
+
+```
+Hedef: cost/gross < 1.0  (şu an ~2.07x → iyileştirme devam ediyor)
+Ölçüm: daily-digest endpoint → cost_efficiency.cost_to_gross_ratio
+```

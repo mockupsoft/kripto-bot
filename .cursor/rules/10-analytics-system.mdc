@@ -1,0 +1,169 @@
+---
+description: Analytics sistemi — metrikler, precision, daily digest, actionability endpoint kuralları
+globs: backend/app/analytics/**/*.py
+alwaysApply: false
+---
+
+# Analytics Sistemi Kuralları
+
+## Temel Metrikler (PnL Engine)
+
+```python
+# analytics/pnl.py
+{
+    "total_trades":    int,    # Kapalı pozisyon sayısı
+    "win_rate":        float,  # Kârlı / toplam
+    "gross_pnl":       float,  # Brüt kâr
+    "net_pnl":         float,  # Net kâr (fees + slippage düşüldükten sonra)
+    "profit_factor":   float,  # gross_win / gross_loss (>1 = kârlı sistem)
+    "expectancy":      float,  # Beklenen kâr per trade (USD)
+    "expectancy_pct":  float,  # Beklenen kâr per trade (%)
+    "max_drawdown":    float,  # Maksimum peak-to-trough düşüş
+}
+```
+
+## Actionability Precision
+
+```python
+# TRADEABLE dediğimiz fırsatların kaçı gerçekten kârlı çıktı?
+# Grade A: >75% kârlı
+# Grade B: 50-75%
+# Grade C: 33-50%
+# Grade D: <33%
+
+# /api/markets/actionability endpoint verdict'leri:
+# TRADEABLE | MARGINAL | SLIPPAGE_RISK | LOW_LIQUIDITY
+# SPREAD_TOO_WIDE | NO_EDGE | STALE_DATA | NO_SIGNAL
+```
+
+## PaperPosition Field'ları
+
+```python
+# paper_positions model — doğru field adları:
+pos.source_wallet_id   # ✅ DOĞRU
+pos.strategy           # strateji adı
+pos.realized_pnl       # kapatılmış PnL
+pos.status             # "open" | "closed"
+
+# ❌ YANLIŞ — bu field yok:
+pos.signal_id          # AttributeError!
+```
+
+## Strategy Health Endpoint
+
+```python
+# GET /api/analytics/strategy-health
+{
+    "strategies": [
+        {
+            "name": "direct_copy",
+            "mode": "active",
+            "rolling_pf": 1.84,       # Son 20 trade profit factor
+            "rolling_pf_7d": 1.65,    # Son 7 gün profit factor
+            "win_rate": 0.71,
+            "expectancy": 0.08,
+            "kill_switch_active": False,
+            "kill_switch_reason": None,
+            "recommended_capital_share": 0.45,
+            "trend": "stable"         # "improving" | "declining" | "stable"
+        }
+    ]
+}
+```
+
+## Daily Digest
+
+```python
+# GET /api/analytics/daily-digest
+# 5 kritik metrik:
+{
+    "profit_factor":     float,   # Sistem PF
+    "expectancy":        float,   # Trade başına beklenen kâr
+    "precision_trend":   str,     # Grade değişimi (A→B, B→C vs.)
+    "cost_gross_ratio":  float,   # Maliyet / brüt kâr (< 0.5 iyi)
+    "sample_size":       int,     # Toplam trade sayısı (200+ hedef)
+}
+```
+
+## Alpha Backtest (Quintile Analizi)
+
+```python
+# GET /api/analytics/alpha-backtest
+# Wallet'ları alpha_score'a göre 5 gruba böl
+# Her grup için PnL ölç
+# Beklenen: üst quintile > alt quintile
+
+# ✅ DOĞRU — PaperPosition → Wallet mapping:
+pos.source_wallet_id   # wallet ID
+
+# ❌ ESKİ (düzeltildi):
+pos.signal_id          # bu field mevcut değildi
+```
+
+## Edge Calibration Endpoint
+
+```python
+# GET /api/analytics/edge-calibration
+# Model'in tahmin ettiği edge gerçekten PnL'ye dönüşüyor mu?
+
+# Bulgular (Mar 2026, n=83, PRE-FIX):
+# pearson_r = -0.10  →  uncalibrated (edge ile PnL korelasyon yok)
+# BUY r     = -0.37  →  inverted    (yüksek edge BUY trade'leri kaybediyor)
+# SELL r    = +0.64  →  calibrated  (SELL edge çalışıyor, küçük örneklem)
+
+# Edge bucket analizi:
+# low_edge  (< 0.05): avg_pnl = -$0.002  (n=24)
+# mid_edge (0.05-0.15): avg_pnl = +$0.18  (n=17)  ← en iyi bucket
+# high_edge (> 0.15): avg_pnl = -$0.05  (n=42)  ← en kötü! 81% miss rate
+
+# Neden high_edge kaybediyor?
+# 1. Bayesian = wallet_score circular logic → edge tahmini gürültü
+# 2. Gerçek spot feed yok → model_probability ~0.5'te takılı
+# 3. wallet_reversal exit agresif olabilir
+
+# Aksiyon: Binance spot feed entegrasyonu öncelik
+# Hedef: pearson_r > 0.3 = well_calibrated
+```
+
+## 3-Layer Edge Model (Düzeltilmiş, Mar 2026)
+
+```python
+# edge.py — 3 katmanlı model (edge şişmesini önler)
+#
+# Layer 1 — Fair Probability (raw_edge):
+#   raw_edge = clamp(q − p, −MAX_RAW_EDGE, +MAX_RAW_EDGE)
+#   MAX_RAW_EDGE = 0.15  (env: MAX_RAW_EDGE)
+#   Neden: wallet_score Bayesian'ı beslediğinde olasılık ıraksıyor
+#   → MAX_RAW_EDGE olmadan edge > 0.3 görünüyor, gerçekte 0.02–0.08 bant
+#
+# Layer 2 — Tradable Edge (net_edge):
+#   net_edge = raw_edge − fee − spread/2 − slippage − fill_risk
+#
+# Layer 3 — Executable Edge:
+#   liquidity_factor = min(1.0, depth_usd / 500)   floor: 0.30
+#   effective_fill_prob = BASE_FILL_PROB × max(0.5, confidence)
+#   executable_edge = net_edge × confidence × fill_prob × liquidity_factor
+#
+# signal_generator.py — wallet_score dampening:
+#   imbalance = (wallet_score - 0.5) × 0.6   # eski: × 2
+#   repricing  = max(0, wallet_score - 0.4) × 0.5   # eski: × 1.5
+#   → probability divergence sınırlandı, edge 0.02–0.10 bandında kalıyor
+#
+# signal_filter.py — executable_edge gate (Gate 3b):
+#   cb = signal.costs_breakdown  # liquidity_factor + fill_probability kaydedilmiş
+#   exec_edge = conf_adjusted_edge × fill_prob × liq_factor
+#   if exec_edge <= 0: reject("exec_edge_nonpositive")
+#
+# Env değişkenleri:
+#   MAX_RAW_EDGE=0.15          # edge cap
+#   BASE_FILL_PROBABILITY=0.70  # spot feed olmadığında fill prob
+```
+
+## Holding Horizon Kategorileri
+
+```python
+# Market actionability endpoint'inde gösterilir
+holding_horizon = "short"    # 1-2 cycle (< 1 dk)
+holding_horizon = "medium"   # 2-10 cycle (1-5 dk)
+holding_horizon = "unstable" # Fırsat çabuk kapanabilir
+```
