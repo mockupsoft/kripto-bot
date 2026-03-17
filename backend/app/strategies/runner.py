@@ -233,9 +233,7 @@ class StrategyRunner:
                     stats["signals_generated"] += 1
                     stats["strategy_funnel"][strat_name]["signals_generated"] += 1
 
-                    # Strategies with bankroll=0 or heavy per-wallet compute: skip evaluation
-                    # leader_copy.evaluate() runs compute_copyable_alpha per wallet (very expensive)
-                    _SKIP_EVALUATE = {"shadow", "leader_copy"}
+                    _SKIP_EVALUATE = {"shadow"}
                     if strat_bankroll <= 0 or strat_name in _SKIP_EVALUATE:
                         continue
 
