@@ -421,15 +421,15 @@ export default function AnalyticsPage() {
             </div>
             <div>
               <p className="text-xs text-gray-500">Expectancy %</p>
-              <p className={`mt-1 text-xl font-bold tabular-nums ${metrics.expectancy_pct > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                {metrics.expectancy_pct > 0 ? '+' : ''}{metrics.expectancy_pct.toFixed(3)}%
+              <p className={`mt-1 text-xl font-bold tabular-nums ${(metrics.expectancy_pct ?? 0) > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                {(metrics.expectancy_pct ?? 0) > 0 ? '+' : ''}{(metrics.expectancy_pct ?? 0).toFixed(3)}%
               </p>
               <p className="text-[10px] text-gray-600">of $900 bankroll</p>
             </div>
             <div>
               <p className="text-xs text-gray-500">Profit Factor</p>
-              <p className={`mt-1 text-xl font-bold tabular-nums ${metrics.profit_factor >= 1.3 ? 'text-emerald-400' : metrics.profit_factor >= 1 ? 'text-yellow-400' : 'text-red-400'}`}>
-                {metrics.profit_factor === Infinity ? 'INF' : metrics.profit_factor.toFixed(3)}
+              <p className={`mt-1 text-xl font-bold tabular-nums ${(metrics.profit_factor ?? 0) >= 1.3 ? 'text-emerald-400' : (metrics.profit_factor ?? 0) >= 1 ? 'text-yellow-400' : 'text-red-400'}`}>
+                {metrics.profit_factor === Infinity ? 'INF' : (metrics.profit_factor ?? 0).toFixed(3)}
               </p>
               <p className="text-[10px] text-gray-600">
                 {metrics.profit_factor >= 1.6 ? 'strong edge' : metrics.profit_factor >= 1.3 ? 'real edge' : metrics.profit_factor >= 1 ? 'weak edge' : 'no edge'}
