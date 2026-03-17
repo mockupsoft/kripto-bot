@@ -346,7 +346,13 @@ async def run_exit_cycle(db: AsyncSession) -> dict[str, Any]:
             strategy = pos.strategy or "direct_copy"
 
             # ── Global Rule 1: Market resolved ────────────────────────────────
-            if market and not market.is_active:
+            # Check both is_active flag AND end_date — Polymarket can be slow to
+            # mark markets as closed/archived, but end_date is always reliable.
+            market_ended = (
+                (market and not market.is_active)
+                or (market and market.end_date and market.end_date.replace(tzinfo=timezone.utc) < now)
+            )
+            if market_ended:
                 exit_price = await get_latest_price(db, pos.market_id) or entry
                 info = await close_position(db, pos, exit_price, "market_resolved")
                 closed.append(info)
