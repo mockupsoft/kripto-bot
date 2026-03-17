@@ -4,12 +4,12 @@ export function fmtUsd(value: number | null | undefined): string {
 }
 
 export function fmtPct(value: number | null | undefined, decimals = 1): string {
-  if (value == null) return '0%';
+  if (value == null) return '—';
   return `${(value * 100).toFixed(decimals)}%`;
 }
 
 export function fmtNum(value: number | null | undefined, decimals = 2): string {
-  if (value == null) return '0';
+  if (value == null) return '—';
   return value.toFixed(decimals);
 }
 

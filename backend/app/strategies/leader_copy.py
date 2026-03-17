@@ -67,7 +67,7 @@ class LeaderCopyStrategy(BaseStrategy):
         self.min_influence_score = min_influence_score
         self._filter = SignalFilter(
             min_net_edge=0.01,
-            max_spread=0.03,
+            max_spread=0.08,
             max_signal_age_ms=5000,
             min_liquidity_usd=30.0,
         )
@@ -82,6 +82,7 @@ class LeaderCopyStrategy(BaseStrategy):
         book_levels=None,
         bankroll: float = 900.0,
         exposure_pct: float = 0.0,
+        **kwargs: object,
     ) -> SignalDecision | None:
         if bankroll <= 0:
             return None
@@ -146,6 +147,8 @@ class LeaderCopyStrategy(BaseStrategy):
             available_depth_usd=available_depth,
             current_bankroll=bankroll,
             current_exposure_pct=exposure_pct,
+            snapshot_cache=kwargs.get("snapshot_cache"),
+            position_counts=kwargs.get("position_counts"),
         )
         if filter_result.decision != "accept":
             return None

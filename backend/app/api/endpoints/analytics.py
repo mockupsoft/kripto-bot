@@ -10,6 +10,7 @@ from app.dependencies import get_db
 from app.models.portfolio import PortfolioSnapshot
 from app.models.paper import PaperOrder, PaperPosition
 from app.models.signal import SignalDecision, TradeSignal
+from app.signals.calibration import HybridProbabilityCalibrator
 
 router = APIRouter()
 
@@ -793,6 +794,169 @@ async def _build_strategy_conversion_funnel(
     return {"since": since.isoformat(), "totals": totals, "by_strategy": by_strategy}
 
 
+async def _build_reject_pareto(db: AsyncSession, since: datetime) -> dict:
+    """Reject reason Pareto for entry-filter diagnostics."""
+    result = await db.execute(
+        select(SignalDecision.reject_reason)
+        .where(
+            SignalDecision.decided_at >= since,
+            SignalDecision.decision == "reject",
+            SignalDecision.reject_reason.isnot(None),
+        )
+    )
+    rows = [r[0] for r in result.all() if r[0]]
+    counts: dict[str, int] = {}
+    for rr in rows:
+        key = str(rr).split(":")[0].strip()
+        counts[key] = counts.get(key, 0) + 1
+    total = sum(counts.values())
+    pareto = sorted(
+        [
+            {
+                "reason_code": k,
+                "count": v,
+                "share": round(v / total, 4) if total else 0.0,
+            }
+            for k, v in counts.items()
+        ],
+        key=lambda x: -x["count"],
+    )
+    dominant = pareto[0] if pareto else None
+    return {
+        "total_rejects": total,
+        "dominant_reason": dominant["reason_code"] if dominant else None,
+        "dominant_reason_share": dominant["share"] if dominant else None,
+        "pareto": pareto[:10],
+    }
+
+
+async def _build_tradable_edge_stats(db: AsyncSession, since: datetime) -> dict:
+    """Tradable/executable edge distribution from signal costs_breakdown."""
+    result = await db.execute(
+        select(TradeSignal).where(TradeSignal.created_at >= since)
+    )
+    signals = result.scalars().all()
+    if not signals:
+        return {
+            "sample_size": 0,
+            "positive_executable_share": None,
+            "negative_or_zero_executable_share": None,
+            "avg_executable_edge": None,
+            "avg_confidence_adjusted_edge": None,
+        }
+    exec_edges: list[float] = []
+    conf_edges: list[float] = []
+    for s in signals:
+        cb = s.costs_breakdown or {}
+        exec_edge = cb.get("executable_edge")
+        conf_edge = cb.get("confidence_adjusted_edge")
+        if conf_edge is None and s.net_edge is not None and s.model_confidence is not None:
+            conf_edge = float(s.net_edge) * float(s.model_confidence)
+        if exec_edge is None:
+            net_edge = float(s.net_edge or 0)
+            conf = float(s.model_confidence or 0.5)
+            liq = float(cb.get("liquidity_factor", 0.8))
+            fp = float(cb.get("fill_probability", 0.6))
+            exec_edge = net_edge * conf * liq * fp
+        if exec_edge is not None:
+            exec_edges.append(float(exec_edge))
+        if conf_edge is not None:
+            conf_edges.append(float(conf_edge))
+    if not exec_edges:
+        return {
+            "sample_size": len(signals),
+            "positive_executable_share": None,
+            "negative_or_zero_executable_share": None,
+            "avg_executable_edge": None,
+            "executable_edge_std": None,
+            "executable_edge_variance": None,
+            "avg_confidence_adjusted_edge": round(sum(conf_edges) / len(conf_edges), 6) if conf_edges else None,
+        }
+    positives = sum(1 for e in exec_edges if e > 0)
+    total = len(exec_edges)
+    avg_exec = sum(exec_edges) / total
+    variance = sum((e - avg_exec) ** 2 for e in exec_edges) / total if total else 0
+    std_exec = variance ** 0.5
+    return {
+        "sample_size": total,
+        "positive_executable_share": round(positives / total, 4),
+        "negative_or_zero_executable_share": round((total - positives) / total, 4),
+        "avg_executable_edge": round(avg_exec, 6),
+        "executable_edge_std": round(std_exec, 6),
+        "executable_edge_variance": round(variance, 8),
+        "avg_confidence_adjusted_edge": round(sum(conf_edges) / len(conf_edges), 6) if conf_edges else None,
+    }
+
+
+async def _build_wallet_concentration_metrics(
+    db: AsyncSession,
+    since: datetime,
+    strategies: tuple[str, ...] = ("direct_copy", "high_conviction"),
+) -> dict:
+    """
+    Wallet concentration KPIs for A/B test: wallet influence reduction.
+    - n_wallets_contributed: distinct wallets with closed trades
+    - top_5_wallet_share: fraction of closed trades from top 5 wallets
+    - direct_copy_pnl_variance: variance of realized_pnl for direct_copy
+    """
+    result = await db.execute(
+        select(
+            PaperPosition.strategy,
+            PaperPosition.source_wallet_id,
+            PaperPosition.realized_pnl,
+        ).where(
+            PaperPosition.status == "closed",
+            PaperPosition.closed_at >= since,
+            PaperPosition.strategy.in_(strategies),
+        )
+    )
+    rows = result.all()
+    out: dict = {}
+    for strat in strategies:
+        strat_rows = [(r[1], r[2]) for r in rows if r[0] == strat]
+        if not strat_rows:
+            out[strat] = {
+                "n_wallets_contributed": 0,
+                "top_5_wallet_share": None,
+                "pnl_variance": None,
+                "pnl_std": None,
+                "close_count": 0,
+            }
+            continue
+        wallet_counts: dict[str | None, int] = {}
+        pnl_values: list[float] = []
+        for w, pnl in strat_rows:
+            key = str(w) if w else None
+            wallet_counts[key] = wallet_counts.get(key, 0) + 1
+            pnl_values.append(float(pnl or 0))
+        n_wallets = len([k for k in wallet_counts if k])
+        total_trades = len(strat_rows)
+        top5_count = sum(
+            c for _, c in sorted(wallet_counts.items(), key=lambda x: -x[1])[:5]
+        )
+        top_5_share = round(top5_count / total_trades, 4) if total_trades else None
+        if len(pnl_values) >= 2:
+            avg_pnl = sum(pnl_values) / len(pnl_values)
+            var_pnl = sum((p - avg_pnl) ** 2 for p in pnl_values) / len(pnl_values)
+            std_pnl = var_pnl ** 0.5
+        else:
+            var_pnl = None
+            std_pnl = None
+        out[strat] = {
+            "n_wallets_contributed": n_wallets,
+            "top_5_wallet_share": top_5_share,
+            "pnl_variance": round(var_pnl, 8) if var_pnl is not None else None,
+            "pnl_std": round(std_pnl, 4) if std_pnl is not None else None,
+            "close_count": total_trades,
+        }
+    return out
+
+
+async def _build_calibration_kpis(db: AsyncSession) -> dict:
+    calibrator = HybridProbabilityCalibrator()
+    return await calibrator.diagnostics(db)
+
+
 @router.get("/validation-cutoff-suggestion")
 async def get_validation_cutoff_suggestion() -> dict:
     """
@@ -1003,9 +1167,15 @@ async def get_strategy_conversion_funnel(
     """Signals -> accepts -> executed trades -> closed trades conversion funnel."""
     since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
     funnel = await _build_strategy_conversion_funnel(db, since=since)
+    reject_pareto = await _build_reject_pareto(db, since=since)
+    edge_stats = await _build_tradable_edge_stats(db, since=since)
+    wallet_concentration = await _build_wallet_concentration_metrics(db, since=since)
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "lookback_hours": lookback_hours,
+        "reject_pareto": reject_pareto,
+        "tradable_edge_stats": edge_stats,
+        "wallet_concentration": wallet_concentration,
         **funnel,
     }
 
@@ -1024,6 +1194,9 @@ async def get_baseline_snapshot(
     strategy_health = await get_strategy_health(db=db)
     since = datetime.now(timezone.utc) - timedelta(hours=cutoff_hours)
     funnel = await _build_strategy_conversion_funnel(db, since=since)
+    calibration = await _build_calibration_kpis(db)
+    reject_pareto = await _build_reject_pareto(db, since=since)
+    tradable_edge_stats = await _build_tradable_edge_stats(db, since=since)
 
     after_trading = (validation.get("after_patch", {}) or {}).get("trading_only", {}) or {}
     after_total = (validation.get("after_patch", {}) or {}).get("total", {}) or {}
@@ -1048,6 +1221,10 @@ async def get_baseline_snapshot(
         "trading_after": after_trading,
         "total_after": after_total,
         "strategy_conversion_funnel": funnel,
+        "reject_pareto": reject_pareto,
+        "calibration_kpis": calibration,
+        "tradable_edge_stats": tradable_edge_stats,
+        "wallet_concentration": await _build_wallet_concentration_metrics(db, since=since),
         "strategy_health_summary": strategy_health.get("summary", {}),
         "stale_data_analytics": {
             "total_stale_exits": stale.get("total_stale_exits"),
@@ -1114,29 +1291,14 @@ async def get_entry_single_knob(
     Suggest exactly one entry knob based on dominant reject reason Pareto.
     """
     since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-    result = await db.execute(
-        select(SignalDecision, TradeSignal.strategy)
-        .join(TradeSignal, TradeSignal.id == SignalDecision.signal_id)
-        .where(
-            SignalDecision.decided_at >= since,
-            SignalDecision.decision == "reject",
-            SignalDecision.reject_reason.isnot(None),
-        )
-    )
-    rows = result.all()
-
-    reason_counts: dict[str, int] = {}
-    for dec, _strategy in rows:
-        reason = str(dec.reject_reason or "unknown")
-        key = reason.split(":")[0]
-        reason_counts[key] = reason_counts.get(key, 0) + 1
-
-    pareto = sorted(
-        [{"reject_reason": k, "count": v} for k, v in reason_counts.items()],
-        key=lambda x: -x["count"],
-    )
-    total_rejects = sum(r["count"] for r in pareto)
-    dominant = pareto[0]["reject_reason"] if pareto else None
+    pareto_data = await _build_reject_pareto(db, since=since)
+    total_rejects = pareto_data["total_rejects"]
+    dominant = pareto_data["dominant_reason"]
+    dominant_share = pareto_data["dominant_reason_share"]
+    pareto = [
+        {"reject_reason": p["reason_code"], "count": p["count"], "share": p["share"]}
+        for p in pareto_data["pareto"]
+    ]
 
     # Single-knob mapping
     param = None
@@ -1167,6 +1329,7 @@ async def get_entry_single_knob(
         "total_rejects": total_rejects,
         "reject_pareto": pareto[:10],
         "dominant_reject_reason": dominant,
+        "dominant_reject_reason_share": dominant_share,
         "current_entry_knobs": {
             "MIN_CONF_EDGE": float(os.getenv("MIN_CONF_EDGE", "0.012")),
             "MAX_SPREAD_ABS": float(os.getenv("MAX_SPREAD_ABS", "0.03")),
@@ -1194,6 +1357,11 @@ async def get_decision_gate_72h(
     """
     validation = await get_validation_report(cutoff_hours=cutoff_hours, db=db)
     settings = get_settings()
+    since = datetime.now(timezone.utc) - timedelta(hours=cutoff_hours)
+    funnel = await _build_strategy_conversion_funnel(db, since=since)
+    calibration = await _build_calibration_kpis(db)
+    edge_stats = await _build_tradable_edge_stats(db, since=since)
+    wallet_concentration = await _build_wallet_concentration_metrics(db, since=since)
     after_patch = validation.get("after_patch", {}) or {}
     before_patch = validation.get("before_patch", {}) or {}
     trading_after = after_patch.get("trading_only", {}) or {}
@@ -1217,6 +1385,14 @@ async def get_decision_gate_72h(
         "stop_loss_stabilized_0_10": abs(float(settings.STOP_LOSS_PCT) - 0.10) < 1e-9,
         "open_positions_controlled": open_positions <= 50,
         "alarms_majority_green": sum(1 for v in alarm_checks.values() if v is True) >= 4,
+        "calibration_healthy": (
+            calibration.get("ece") is None
+            or float(calibration.get("ece")) <= 0.12
+        ),
+        "executable_edge_positive_share_ok": (
+            edge_stats.get("positive_executable_share") is None
+            or float(edge_stats.get("positive_executable_share")) >= 0.5
+        ),
     }
     keep = all(keep_conditions.values())
 
@@ -1248,7 +1424,149 @@ async def get_decision_gate_72h(
             "stop_loss_pct": float(settings.STOP_LOSS_PCT),
             "open_positions": open_positions,
             "alarm_checks": alarm_checks,
+            "calibration_kpis": calibration,
+            "tradable_edge_stats": edge_stats,
+            "wallet_concentration": wallet_concentration,
+            "funnel_totals": funnel.get("totals", {}),
         },
+    }
+
+
+@router.get("/phase-decision-script")
+async def get_phase_decision_script(
+    cutoff_hours: int = Query(72, ge=24, le=240),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    Decision support script output (report-only, no automatic config changes).
+
+    Produces:
+      1) phase decision: CONTINUE / WATCH / ROLLBACK_CANDIDATE
+      2) decision reasons (human-readable)
+      3) single next recommendation
+      4) veto flags
+      5) top dashboard metrics (9-line compact view)
+    """
+    validation = await get_validation_report(cutoff_hours=cutoff_hours, db=db)
+    since = datetime.now(timezone.utc) - timedelta(hours=cutoff_hours)
+    funnel = await _build_strategy_conversion_funnel(db, since=since)
+    reject_pareto = await _build_reject_pareto(db, since=since)
+    calibration = await _build_calibration_kpis(db)
+    edge_stats = await _build_tradable_edge_stats(db, since=since)
+    wallet_concentration = await _build_wallet_concentration_metrics(db, since=since)
+
+    before_trading = ((validation.get("before_patch") or {}).get("trading_only") or {})
+    after_trading = ((validation.get("after_patch") or {}).get("trading_only") or {})
+    stale_before = ((validation.get("before_patch") or {}).get("stale_data_share"))
+    stale_after = ((validation.get("after_patch") or {}).get("stale_data_share"))
+    open_positions = await db.scalar(select(func.count()).where(PaperPosition.status == "open")) or 0
+
+    pf_before = before_trading.get("pf")
+    pf_after = after_trading.get("pf")
+    exp_before = before_trading.get("avg_pnl_per_trade")
+    exp_after = after_trading.get("avg_pnl_per_trade")
+
+    veto_flags = {
+        "stale_share_worse": (
+            isinstance(stale_before, (int, float))
+            and isinstance(stale_after, (int, float))
+            and stale_after > stale_before
+        ),
+        "trading_only_pf_not_improved": (
+            isinstance(pf_before, (int, float))
+            and isinstance(pf_after, (int, float))
+            and pf_after <= pf_before
+        ),
+        "avg_pnl_per_trade_not_improved": (
+            isinstance(exp_before, (int, float))
+            and isinstance(exp_after, (int, float))
+            and exp_after <= exp_before
+        ),
+        "open_positions_risk": open_positions > 80,
+    }
+
+    # Reasons
+    reasons: list[str] = []
+    if isinstance(pf_before, (int, float)) and isinstance(pf_after, (int, float)):
+        reasons.append(
+            "trading_only_pf_improved" if pf_after > pf_before else "trading_only_pf_not_improved"
+        )
+    if isinstance(exp_before, (int, float)) and isinstance(exp_after, (int, float)):
+        reasons.append(
+            "expectancy_improved" if exp_after > exp_before else "expectancy_not_improved"
+        )
+    if isinstance(stale_before, (int, float)) and isinstance(stale_after, (int, float)):
+        reasons.append(
+            "stale_share_improved" if stale_after < stale_before else "stale_share_worse"
+        )
+    pos_exec_share = edge_stats.get("positive_executable_share")
+    if isinstance(pos_exec_share, (int, float)):
+        reasons.append(
+            "positive_executable_share_healthy"
+            if pos_exec_share >= 0.5
+            else "positive_executable_share_low"
+        )
+    dominant_reject = reject_pareto.get("dominant_reason")
+    if dominant_reject:
+        reasons.append(f"reject_pareto_dominated_by_{dominant_reject}")
+    if veto_flags["open_positions_risk"]:
+        reasons.append("open_positions_risk_high")
+
+    # Decision with veto logic
+    hard_veto_count = sum(
+        1
+        for k in (
+            "stale_share_worse",
+            "trading_only_pf_not_improved",
+            "avg_pnl_per_trade_not_improved",
+        )
+        if veto_flags[k]
+    )
+    if hard_veto_count >= 2:
+        phase_decision = "ROLLBACK_CANDIDATE"
+    elif hard_veto_count == 1 or veto_flags["open_positions_risk"]:
+        phase_decision = "WATCH"
+    else:
+        phase_decision = "CONTINUE"
+
+    # Single recommendation
+    if phase_decision == "CONTINUE":
+        next_recommendation = "Phase 2A continue"
+    elif veto_flags["stale_share_worse"]:
+        next_recommendation = "Move to stale disabled test"
+    elif dominant_reject:
+        next_recommendation = "Inspect top reject reason first"
+    else:
+        next_recommendation = "Keep current phase and monitor"
+
+    # Top-9 compact dashboard lines + wallet concentration (A/B test KPIs)
+    by_strat = {r["strategy"]: r for r in funnel.get("by_strategy", [])}
+    dc_wallet = (wallet_concentration.get("direct_copy") or {})
+    top9 = {
+        "trading_only_pf": pf_after,
+        "avg_pnl_per_trade": exp_after,
+        "stale_data_share": stale_after,
+        "positive_executable_share": pos_exec_share,
+        "calibration_method": calibration.get("method"),
+        "calibration_sample_size": calibration.get("sample_size"),
+        "top_reject_reason": dominant_reject,
+        "direct_copy_pf": (by_strat.get("direct_copy") or {}).get("pf"),
+        "high_conviction_pf": (by_strat.get("high_conviction") or {}).get("pf"),
+        "n_wallets_contributed": dc_wallet.get("n_wallets_contributed"),
+        "top_5_wallet_share": dc_wallet.get("top_5_wallet_share"),
+        "direct_copy_pnl_variance": dc_wallet.get("pnl_variance"),
+        "executable_edge_std": edge_stats.get("executable_edge_std"),
+    }
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "window_hours": cutoff_hours,
+        "phase_decision": phase_decision,
+        "decision_reasons": reasons,
+        "next_single_recommendation": next_recommendation,
+        "veto_flags": veto_flags,
+        "top_dashboard_metrics": top9,
+        "wallet_concentration": wallet_concentration,
     }
 
 

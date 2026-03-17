@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any
 
@@ -552,11 +553,11 @@ async def ingest_wallet_activity(wallet_address: str) -> int:
     Fetch and store recent trades for a specific wallet.
     Returns number of new trades ingested.
     """
-    trades = await fetch_wallet_trades(wallet_address, limit=20)
+    trades = await fetch_wallet_trades(wallet_address, limit=10)
     if not trades:
         return 0
 
-    async with async_session_factory() as db:
+    async with async_session_factory(autoflush=False) as db:
         from sqlalchemy import select
 
         # Find or create wallet
@@ -570,23 +571,15 @@ async def ingest_wallet_activity(wallet_address: str) -> int:
         count = 0
         for trade in trades:
             try:
-                # Deduplicate by tx hash
                 tx_hash = trade.get("transactionHash") or trade.get("id") or ""
+
+                # Skip if already ingested (dedup by tx hash)
                 if tx_hash:
                     dup = await db.execute(
                         select(WalletTransaction).where(WalletTransaction.source_sequence_id == tx_hash)
                     )
                     if dup.scalar_one_or_none():
                         continue
-
-                # Store raw event
-                await store_raw_event(
-                    db=db,
-                    source="polymarket_data_api",
-                    event_type="wallet_trade",
-                    payload={**trade, "_wallet": wallet_address},
-                    source_timestamp=datetime.now(timezone.utc),
-                )
 
                 # Parse timestamps
                 occurred_str = trade.get("timestamp") or trade.get("createdAt") or trade.get("time")
@@ -660,11 +653,14 @@ async def ingest_wallet_activity(wallet_address: str) -> int:
                     source="polymarket_data_api",
                     source_sequence_id=tx_hash or None,
                 )
-                db.add(tx)
+                # savepoint per trade: if flush raises UniqueViolation the savepoint
+                # rolls back cleanly without poisoning the outer session.
+                async with db.begin_nested():
+                    db.add(tx)
                 count += 1
 
             except Exception as e:
-                logger.warning(f"Failed to process trade for {wallet_address}: {e}")
+                logger.debug(f"Skipped trade for {wallet_address}: {type(e).__name__}: {str(e)[:80]}")
                 continue
 
         await db.commit()
@@ -676,8 +672,13 @@ async def run_live_ingestion_cycle() -> dict:
     """
     One full ingestion cycle:
     1. Fetch live markets
-    2. Fetch wallet activity for tracked wallets  
+    2. Fetch wallet activity for tracked wallets
     3. Normalize pending raw events
+    4. Auto-discover new wallets
+    5. Rescore wallets with new trades
+
+    NOTE: Strategy runner and exit engine are now separate supervised tasks
+    in main.py so they run every 30s / 60s regardless of wallet ingestion time.
     """
     results: dict[str, Any] = {}
 
@@ -691,7 +692,7 @@ async def run_live_ingestion_cycle() -> dict:
 
     await asyncio.sleep(REQUEST_DELAY)
 
-    # Step 2: Tracked wallet activity
+    # Step 2: Tracked wallet activity — sequential to keep memory low
     async with async_session_factory() as db:
         from sqlalchemy import select
         wallets_result = await db.execute(
@@ -699,17 +700,20 @@ async def run_live_ingestion_cycle() -> dict:
         )
         tracked_wallets = wallets_result.scalars().all()
 
+    real_wallets = [w for w in tracked_wallets if not w.address.startswith("0xdemo")]
+
     wallet_trades = 0
-    for wallet in tracked_wallets:
-        # Skip demo wallets (addresses starting with 0xdemo)
-        if wallet.address.startswith("0xdemo"):
-            continue
+    import gc
+
+    for idx, wallet in enumerate(real_wallets):
         try:
-            count = await ingest_wallet_activity(wallet.address)
-            wallet_trades += count
-            await asyncio.sleep(REQUEST_DELAY)
+            n = await ingest_wallet_activity(wallet.address)
+            wallet_trades += n
         except Exception as e:
             logger.warning(f"Wallet ingestion failed for {wallet.address}: {e}")
+        await asyncio.sleep(REQUEST_DELAY)
+        if (idx + 1) % 10 == 0:
+            gc.collect()
 
     results["wallet_trades_ingested"] = wallet_trades
 
@@ -723,32 +727,7 @@ async def run_live_ingestion_cycle() -> dict:
         logger.error(f"Event normalization failed: {e}")
         results["events_normalized"] = 0
 
-    # Step 4: Run strategy engine — generate signals and execute paper trades
-    try:
-        from app.strategies.runner import StrategyRunner
-        runner = StrategyRunner()
-        async with async_session_factory() as db:
-            strategy_stats = await runner.run_cycle(db)
-            await db.commit()
-            results["signals_generated"] = strategy_stats.get("signals_generated", 0)
-            results["trades_executed"] = strategy_stats.get("trades_executed", 0)
-            if "kill_switch" in strategy_stats:
-                logger.info(f"Strategy runner: kill_switch={strategy_stats['kill_switch']}")
-            elif strategy_stats.get("trades_executed", 0) > 0:
-                logger.info(f"Strategy runner: {strategy_stats}")
-            elif strategy_stats.get("signals_generated", 0) > 0:
-                funnel = strategy_stats.get("strategy_funnel", {})
-                logger.info(
-                    "Strategy runner: signals=%s trades_executed=0 funnel=%s",
-                    strategy_stats.get("signals_generated"),
-                    funnel,
-                )
-    except Exception as e:
-        logger.error(f"Strategy runner failed: {e}")
-        results["signals_generated"] = 0
-        results["trades_executed"] = 0
-
-    # Step 5: Auto-discover new wallets from trade stream
+    # Step 4: Auto-discover new wallets from trade stream
     try:
         from app.intelligence.wallet_discovery import run_discovery_cycle
         discovery = await run_discovery_cycle()
@@ -757,31 +736,18 @@ async def run_live_ingestion_cycle() -> dict:
         logger.error(f"Wallet discovery failed: {e}")
         results["wallets_discovered"] = 0
 
-    # Step 6: Rescore wallets that have new trades
+    # Step 5: Rescore wallets that have new trades (isolated sessions)
     if wallet_trades > 0:
         try:
             await rescore_active_wallets()
         except Exception as e:
             logger.warning(f"Wallet rescoring failed: {e}")
 
-    # Step 7: Run exit engine — close positions that hit exit rules
-    try:
-        from app.execution.exit_engine import run_exit_cycle
-        async with async_session_factory() as db:
-            exit_result = await run_exit_cycle(db)
-            results["positions_closed"] = exit_result.get("closed", 0)
-            results["positions_checked"] = exit_result.get("checked", 0)
-            if exit_result.get("closed", 0) > 0:
-                logger.info(f"Exit engine closed {exit_result['closed']} positions")
-    except Exception as e:
-        logger.error(f"Exit engine failed: {e}")
-        results["positions_closed"] = 0
-
     return results
 
 
 async def rescore_active_wallets() -> None:
-    """Rescore all real tracked wallets that have trade data."""
+    """Rescore all real tracked wallets with isolated per-wallet sessions."""
     from sqlalchemy import select
     from app.intelligence.wallet_scorer import score_and_persist
 
@@ -794,42 +760,75 @@ async def rescore_active_wallets() -> None:
         )
         wallets = result.scalars().all()
 
-        for wallet in wallets:
-            try:
-                await score_and_persist(db, wallet.id)
-            except Exception as e:
-                logger.debug(f"Rescore failed for {wallet.address[:10]}: {e}")
-
+    scored = 0
+    for wallet in wallets:
         try:
-            await db.commit()
-        except Exception:
-            await db.rollback()
+            async with async_session_factory() as score_db:
+                await score_and_persist(score_db, wallet.id)
+                await score_db.commit()
+                scored += 1
+        except Exception as e:
+            logger.debug(f"Rescore failed for {wallet.address[:10]}: {e}")
+
+
+async def run_wallet_scoring_cycle() -> int:
+    """Score all tracked wallets in isolated per-wallet sessions.
+
+    Each wallet gets its own session so a UniqueViolation or scoring error
+    can never taint the runner session or block subsequent wallets.
+    Returns count of successfully scored wallets.
+    """
+    from app.intelligence.wallet_scorer import score_and_persist
+
+    async with async_session_factory() as db:
+        from sqlalchemy import select as _select
+        wallets = (
+            await db.execute(_select(Wallet).where(Wallet.is_tracked == True))  # noqa: E712
+        ).scalars().all()
+
+    scored = 0
+    for w in wallets:
+        try:
+            async with async_session_factory() as score_db:
+                await score_and_persist(score_db, w.id)
+                await score_db.commit()
+                scored += 1
+        except Exception as exc:
+            logger.warning(f"Wallet scoring skipped for {w.id}: {exc}")
+    if scored:
+        logger.info(f"Wallet scoring cycle complete: {scored}/{len(wallets)} wallets scored")
+    return scored
 
 
 async def start_live_polling(
     market_interval: int = 30,
     wallet_interval: int = 60,
     discovery_interval: int = 120,
+    scoring_interval: int = 900,
 ) -> None:
     """
     Start continuous live polling loop.
     market_interval: seconds between market refreshes
     wallet_interval: seconds between wallet activity checks
     discovery_interval: seconds between auto-discovery cycles
+    scoring_interval: seconds between wallet scoring runs (default 15 min)
     """
     logger.info(
         f"Starting live Polymarket polling (markets/{market_interval}s, "
-        f"wallets/{wallet_interval}s, discovery/{discovery_interval}s)"
+        f"wallets/{wallet_interval}s, discovery/{discovery_interval}s, "
+        f"scoring/{scoring_interval}s)"
     )
 
     last_wallet_poll = 0.0
     last_discovery = 0.0
+    last_scoring = 0.0
 
     while True:
         try:
             now = asyncio.get_event_loop().time()
             do_wallets = (now - last_wallet_poll) >= wallet_interval
             do_discovery = (now - last_discovery) >= discovery_interval
+            do_scoring = (now - last_scoring) >= scoring_interval
 
             if do_wallets:
                 result = await run_live_ingestion_cycle()
@@ -853,6 +852,15 @@ async def start_live_polling(
                         last_discovery = now
                     except Exception as e:
                         logger.warning(f"Discovery cycle error: {e}")
+
+            # Run wallet scoring on its own schedule (isolated, non-blocking)
+            if do_scoring:
+                try:
+                    scored = await run_wallet_scoring_cycle()
+                    result["wallets_scored"] = scored
+                    last_scoring = now
+                except Exception as e:
+                    logger.warning(f"Wallet scoring cycle error: {e}")
 
             logger.info(f"Live ingestion cycle: {result}")
 

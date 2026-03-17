@@ -72,6 +72,7 @@ class DislocationStrategy(BaseStrategy):
         book_levels: dict | None,
         bankroll: float,
         exposure_pct: float,
+        **kwargs: object,
     ) -> SignalDecision | None:
         # Gate 1: z-score must exceed threshold
         z = float(signal.spread_z_score or 0)

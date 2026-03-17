@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.models.signal import TradeSignal
+from app.signals.calibration import HybridProbabilityCalibrator
 from app.signals.bayesian import BayesianEstimator, BayesianEstimate
 from app.signals.edge import calculate_edge, EdgeResult
 from app.signals.spread import SpreadDetector, SpreadSignal
@@ -19,10 +22,16 @@ class SignalGenerator:
     def __init__(self):
         self._estimators: dict[str, BayesianEstimator] = {}
         self._spread_detector = SpreadDetector(window_size=100, z_threshold=2.0)
+        self._calibrator = HybridProbabilityCalibrator()
 
-    def get_estimator(self, market_id: str) -> BayesianEstimator:
+    def get_estimator(self, market_id: str, market_price: float = 0.5) -> BayesianEstimator:
         if market_id not in self._estimators:
-            self._estimators[market_id] = BayesianEstimator()
+            # Anchor prior to market price so model starts near market consensus.
+            # Beta(a, b) with mean = market_price: use total=4 (weak prior).
+            total = 4.0
+            a = max(0.5, market_price * total)
+            b = max(0.5, (1 - market_price) * total)
+            self._estimators[market_id] = BayesianEstimator(prior_alpha=a, prior_beta=b)
         return self._estimators[market_id]
 
     async def generate_copy_signal(
@@ -35,65 +44,75 @@ class SignalGenerator:
         fees_enabled: bool,
         fee_rate_bps: int,
         spread: float,
-        spot_move: float = 0.0,
-        volatility: float = 0.0,
-        book_imbalance: float = 0.0,
-        repricing_speed: float = 0.0,
-        wallet_score: float = 0.5,  # [0, 1] composite wallet quality score
-        available_depth_usd: float = 200.0,  # for Layer-3 liquidity factor
+        wallet_side: str = "BUY",
+        wallet_score: float = 0.5,
+        available_depth_usd: float = 200.0,
     ) -> TradeSignal:
-        estimator = self.get_estimator(str(market_id))
+        settings = get_settings()
 
-        # Wallet score as behavioral signal — maps to [-1, 1] but deliberately dampened.
-        # Without a real spot feed this is the only dynamic Bayesian input, so we reduce
-        # its weight to avoid probability divergence (edge inflation).
-        # Scale: score=0.8 → imbalance=+0.30  (not 0.60 as before)
-        #        score=0.2 → imbalance=-0.30
-        # This keeps raw_edge within a realistic ±0.10 band before the MAX_RAW_EDGE cap.
-        effective_book_imbalance = (
-            book_imbalance if book_imbalance != 0
-            else (wallet_score - 0.5) * 0.6   # dampened: was *2
-        )
-        effective_repricing = (
-            repricing_speed if repricing_speed != 0
-            else max(0.0, (wallet_score - 0.4) * 0.5)   # dampened: was *1.5
-        )
+        # Direct wallet-boost copy model (heuristic alpha, not Bayesian).
+        # We copy the wallet's direction: wallet BUY → we BUY, wallet SELL → we SELL.
+        # Edge = wallet_quality_boost, applied in the wallet's direction.
+        _GATE_THRESHOLD = float(settings.DIRECT_COPY_MIN_COMPOSITE)  # 0.35
+        _BOOST = float(os.getenv("COPY_EDGE_BOOST", "0.12"))
+        wallet_edge = max(0.0, (wallet_score - _GATE_THRESHOLD) * _BOOST)
 
-        estimate = estimator.update(
-            spot_move_direction=spot_move,
-            volatility_signal=volatility,
-            order_book_imbalance=effective_book_imbalance,
-            repricing_speed=effective_repricing,
-        )
+        side = wallet_side.upper() if wallet_side else "BUY"
+        if side == "SELL":
+            copy_prob = max(0.01, min(0.99, market_price - wallet_edge))
+        else:
+            copy_prob = max(0.01, min(0.99, market_price + wallet_edge))
 
-        edge = calculate_edge(
-            model_probability=estimate.model_probability,
-            market_price=market_price,
-            model_confidence=estimate.confidence,
-            fees_enabled=fees_enabled,
-            fee_rate_bps=fee_rate_bps,
-            spread=spread,
-            available_depth_usd=available_depth_usd,
-        )
+        copy_confidence = min(1.0, 0.3 + wallet_score * 0.7)
 
-        side = "BUY" if estimate.model_probability > market_price else "SELL"
+        # Edge is always the absolute divergence — positive means "trade is worth it"
+        # regardless of direction. calculate_edge uses signed (q - p), so for SELL
+        # we flip: pass (1 - copy_prob) vs (1 - market_price) to get positive edge.
+        if side == "SELL":
+            edge = calculate_edge(
+                model_probability=1.0 - copy_prob,
+                market_price=1.0 - market_price,
+                model_confidence=copy_confidence,
+                fees_enabled=fees_enabled,
+                fee_rate_bps=fee_rate_bps,
+                spread=spread,
+                available_depth_usd=available_depth_usd,
+            )
+        else:
+            edge = calculate_edge(
+                model_probability=copy_prob,
+                market_price=market_price,
+                model_confidence=copy_confidence,
+                fees_enabled=fees_enabled,
+                fee_rate_bps=fee_rate_bps,
+                spread=spread,
+                available_depth_usd=available_depth_usd,
+            )
 
+        from app.models.base import new_uuid
         signal = TradeSignal(
+            id=new_uuid(),
             strategy=strategy,
             source_type="wallet_copy",
             source_wallet_id=wallet_id,
             market_id=market_id,
             created_at=datetime.now(timezone.utc),
             side=side,
-            model_probability=estimate.model_probability,
-            model_confidence=estimate.confidence,
+            model_probability=copy_prob,
+            model_confidence=copy_confidence,
             market_price=market_price,
             raw_edge=edge.raw_edge,
             net_edge=edge.net_edge,
-            costs_breakdown=edge.costs_breakdown,
+            costs_breakdown={
+                **edge.costs_breakdown,
+                "calibration_method": "copy_direct",
+                "model_probability_raw": round(copy_prob, 6),
+                "wallet_score": round(wallet_score, 4),
+                "wallet_edge_boost": round(wallet_edge, 6),
+                "wallet_side": side,
+            },
         )
         db.add(signal)
-        await db.flush()
         return signal
 
     async def generate_dislocation_signal(
@@ -128,9 +147,10 @@ class SignalGenerator:
 
         # Fair value: mean of both prices (simplistic but honest)
         model_prob = (price_a + price_b) / 2
+        calibrated_prob = model_prob
 
         edge = calculate_edge(
-            model_probability=model_prob,
+            model_probability=calibrated_prob,
             market_price=underpriced_price,
             model_confidence=0.7,
             fees_enabled=fees_enabled,
@@ -138,7 +158,9 @@ class SignalGenerator:
             spread=spread,
         )
 
+        from app.models.base import new_uuid
         signal = TradeSignal(
+            id=new_uuid(),
             strategy="dislocation",
             source_type="spread_anomaly",
             market_id=underpriced_market,
@@ -152,8 +174,12 @@ class SignalGenerator:
             raw_edge=edge.raw_edge,
             net_edge=edge.net_edge,
             spread_z_score=spread_signal.z_score,
-            costs_breakdown=edge.costs_breakdown,
+            costs_breakdown={
+                **edge.costs_breakdown,
+                "calibrated_probability": round(calibrated_prob, 6),
+                "calibration_method": "identity_dislocation",
+                "model_probability_raw": round(float(model_prob), 6),
+            },
         )
         db.add(signal)
-        await db.flush()
         return signal

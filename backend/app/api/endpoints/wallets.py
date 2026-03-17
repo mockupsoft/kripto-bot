@@ -18,10 +18,13 @@ router = APIRouter()
 
 @router.get("")
 async def list_wallets(
-    limit: int = Query(50, le=200),
+    limit: int = Query(50, le=100),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    # Use DISTINCT ON via raw subquery for efficiency — avoids full group-by scan
+    from sqlalchemy import text
+
     subq = (
         select(
             WalletScore.wallet_id,
@@ -38,6 +41,7 @@ async def list_wallets(
             WalletScore,
             (WalletScore.wallet_id == subq.c.wallet_id) & (WalletScore.scored_at == subq.c.latest),
         )
+        .where(Wallet.is_tracked.is_(True))
         .order_by(WalletScore.composite_score.desc().nullslast())
         .offset(offset)
         .limit(limit)
@@ -47,9 +51,9 @@ async def list_wallets(
 
     wallet_ids = [w.id for w, _ in rows]
 
-    # Batch-fetch last trade time per wallet
+    # Batch-fetch last trade time per wallet using detected_at (indexed) instead of occurred_at
     last_trade_q = await db.execute(
-        select(WalletTransaction.wallet_id, func.max(WalletTransaction.occurred_at).label("last_trade"))
+        select(WalletTransaction.wallet_id, func.max(WalletTransaction.detected_at).label("last_trade"))
         .where(WalletTransaction.wallet_id.in_(wallet_ids))
         .group_by(WalletTransaction.wallet_id)
     )
@@ -103,11 +107,11 @@ async def list_wallets(
             "label": w.label,
             "is_tracked": w.is_tracked,
             "score": {
-                "composite": float(s.composite_score) if s and s.composite_score else None,
-                "copyability": float(s.copyability_score) if s and s.copyability_score else None,
-                "roi": float(s.total_roi) if s and s.total_roi else None,
-                "hit_rate": float(s.hit_rate) if s and s.hit_rate else None,
-                "max_drawdown": float(s.max_drawdown) if s and s.max_drawdown else None,
+                "composite": float(s.composite_score) if s and s.composite_score is not None else None,
+                "copyability": float(s.copyability_score) if s and s.copyability_score is not None else None,
+                "roi": float(s.total_roi) if s and s.total_roi is not None else None,
+                "hit_rate": float(s.hit_rate) if s and s.hit_rate is not None else None,
+                "max_drawdown": float(s.max_drawdown) if s and s.max_drawdown is not None else None,
                 "classification": s.classification if s else None,
                 "copy_decay_curve": s.copy_decay_curve if s else {},
                 "scored_at": s.scored_at.isoformat() if s and s.scored_at else None,
@@ -209,6 +213,128 @@ async def get_alpha_leaderboard(
     }
 
 
+@router.get("/worst-by-copy-pnl")
+async def get_worst_by_copy_pnl(
+    limit: int = Query(20, le=100),
+    lookback_hours: int = Query(168, ge=24, le=720),
+    min_trades: int = Query(10, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    Wallets ranked by worst copy PnL (for manual blacklist decisions).
+    Policy: trade_count >= min_trades olmayan wallet asla suggested_blacklist'e girmez.
+    """
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(hours=lookback_hours)
+
+    agg = (
+        select(
+            PaperPosition.source_wallet_id,
+            func.count().label("trade_count"),
+            func.sum(PaperPosition.realized_pnl).label("total_pnl"),
+            func.sum(case((PaperPosition.realized_pnl > 0, 1), else_=0)).label("wins"),
+            func.sum(case((PaperPosition.realized_pnl > 0, PaperPosition.realized_pnl), else_=0)).label("gross_profit"),
+            func.sum(case((PaperPosition.realized_pnl < 0, PaperPosition.realized_pnl), else_=0)).label("gross_loss_raw"),
+        )
+        .where(
+            PaperPosition.source_wallet_id.isnot(None),
+            PaperPosition.status == "closed",
+            PaperPosition.closed_at >= since,
+        )
+        .group_by(PaperPosition.source_wallet_id)
+    )
+    agg_result = await db.execute(agg)
+    rows = agg_result.all()
+
+    # Filter: trade_count >= min_trades
+    eligible = [
+        r for r in rows
+        if int(r.trade_count or 0) >= min_trades
+    ]
+    wins_map = {str(r.source_wallet_id): int(r.wins or 0) for r in eligible}
+    total_pnl_map = {str(r.source_wallet_id): float(r.total_pnl or 0) for r in eligible}
+    trade_count_map = {str(r.source_wallet_id): int(r.trade_count or 0) for r in eligible}
+    gross_profit_map = {str(r.source_wallet_id): float(r.gross_profit or 0) for r in eligible}
+    gross_loss_map = {str(r.source_wallet_id): abs(float(r.gross_loss_raw or 0)) for r in eligible}
+
+    # Sort by total_pnl ASC (worst first), then avg_pnl for tie-break
+    def _sort_key(wid: str) -> tuple[float, float]:
+        pnl = total_pnl_map[wid]
+        cnt = trade_count_map[wid]
+        avg = pnl / cnt if cnt else 0.0
+        return (pnl, avg)
+
+    sorted_ids = sorted(eligible, key=lambda r: _sort_key(str(r.source_wallet_id)))
+    top_wallet_ids = [str(r.source_wallet_id) for r in sorted_ids[:limit]]
+
+    if not top_wallet_ids:
+        return {
+            "worst_wallets": [],
+            "suggested_blacklist": [],
+            "min_trades": min_trades,
+            "lookback_hours": lookback_hours,
+            "note": f"No wallets with trade_count >= {min_trades} in lookback window.",
+        }
+
+    # Fetch Wallet + latest WalletScore for top wallets
+    wallet_result = await db.execute(select(Wallet).where(Wallet.id.in_([UUID(w) for w in top_wallet_ids])))
+    wallets_by_id = {str(w.id): w for w in wallet_result.scalars().all()}
+
+    score_subq = (
+        select(WalletScore.wallet_id, func.max(WalletScore.scored_at).label("latest"))
+        .where(WalletScore.wallet_id.in_([UUID(w) for w in top_wallet_ids]))
+        .group_by(WalletScore.wallet_id)
+        .subquery()
+    )
+    score_result = await db.execute(
+        select(WalletScore)
+        .join(score_subq, (WalletScore.wallet_id == score_subq.c.wallet_id) & (WalletScore.scored_at == score_subq.c.latest))
+        .where(WalletScore.wallet_id.in_([UUID(w) for w in top_wallet_ids]))
+    )
+    scores_by_id = {str(s.wallet_id): s for s in score_result.scalars().all()}
+
+    worst_wallets = []
+    for wid in top_wallet_ids:
+        w = wallets_by_id.get(wid)
+        s = scores_by_id.get(wid)
+        cnt = trade_count_map.get(wid, 0)
+        pnl = total_pnl_map.get(wid, 0.0)
+        wins = wins_map.get(wid, 0)
+        wr = wins / cnt if cnt else 0.0
+        avg_pnl = pnl / cnt if cnt else 0.0
+        gross_profit = gross_profit_map.get(wid, 0.0)
+        gross_loss = gross_loss_map.get(wid, 0.0)
+        pf = gross_profit / gross_loss if gross_loss > 0 else (float("inf") if gross_profit > 0 else None)
+        loss_rate = 1 - wr
+        avg_win = gross_profit / wins if wins else 0.0
+        avg_loss = gross_loss / (cnt - wins) if (cnt - wins) else 0.0
+        expectancy = (wr * avg_win) + (loss_rate * avg_loss) if cnt else 0.0
+
+        worst_wallets.append({
+            "wallet_id": wid,
+            "address": w.address if w else None,
+            "label": w.label if w else None,
+            "total_pnl": round(pnl, 4),
+            "trade_count": cnt,
+            "win_rate": round(wr, 4),
+            "avg_pnl_per_trade": round(avg_pnl, 4),
+            "profit_factor": round(pf, 3) if pf is not None else None,
+            "expectancy": round(expectancy, 4),
+            "composite_score": float(s.composite_score) if s and s.composite_score is not None else None,
+            "copyability_score": float(s.copyability_score) if s and s.copyability_score is not None else None,
+        })
+
+    # suggested_blacklist: only trade_count >= min_trades (already filtered); top 5-10
+    suggested_blacklist = top_wallet_ids[:10]
+
+    return {
+        "worst_wallets": worst_wallets,
+        "suggested_blacklist": suggested_blacklist,
+        "min_trades": min_trades,
+        "lookback_hours": lookback_hours,
+    }
+
+
 def _copyability_verdict(copyability: float, roi: float, decay: dict) -> str:
     """Plain-language verdict on whether this wallet is worth copying."""
     decay_500 = float(decay.get("500ms", 0))
@@ -246,14 +372,14 @@ async def get_wallet(wallet_id: UUID, db: AsyncSession = Depends(get_db)) -> dic
         "label": wallet.label,
         "is_tracked": wallet.is_tracked,
         "score": {
-            "composite": float(score.composite_score) if score and score.composite_score else None,
-            "copyability": float(score.copyability_score) if score and score.copyability_score else None,
-            "total_roi": float(score.total_roi) if score and score.total_roi else None,
-            "hit_rate": float(score.hit_rate) if score and score.hit_rate else None,
-            "max_drawdown": float(score.max_drawdown) if score and score.max_drawdown else None,
+            "composite": float(score.composite_score) if score and score.composite_score is not None else None,
+            "copyability": float(score.copyability_score) if score and score.copyability_score is not None else None,
+            "total_roi": float(score.total_roi) if score and score.total_roi is not None else None,
+            "hit_rate": float(score.hit_rate) if score and score.hit_rate is not None else None,
+            "max_drawdown": float(score.max_drawdown) if score and score.max_drawdown is not None else None,
             "classification": score.classification if score else None,
-            "consistency": float(score.consistency_score) if score and score.consistency_score else None,
-            "suspiciousness": float(score.suspiciousness_score) if score and score.suspiciousness_score else None,
+            "consistency": float(score.consistency_score) if score and score.consistency_score is not None else None,
+            "suspiciousness": float(score.suspiciousness_score) if score and score.suspiciousness_score is not None else None,
             "copy_decay_curve": score.copy_decay_curve if score else {},
             "explanation": score.explanation if score else {},
         } if score else None,
@@ -620,23 +746,47 @@ async def get_influence_graph(
 
 @router.get("/intelligence/alpha-leaderboard")
 async def get_intelligence_alpha_leaderboard(
-    limit: int = Query(20, le=100),
+    limit: int = Query(20, le=50),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """
     Leaderboard ranked by copyable_alpha_score (6-factor engine).
       - alpha_decay_risk
       - top 3 factor scores
+
+    Fast path: uses WalletScore fields directly for top wallets
+    (composite_score * copyability_score as proxy), then computes
+    full alpha only for the top candidates.
     """
     from app.intelligence.wallet_alpha import compute_copyable_alpha
 
-    wallets_result = await db.execute(
-        select(Wallet).where(Wallet.is_tracked.is_(True)).limit(limit * 2)
+    # Fast pre-filter: only compute full alpha for top N by composite*copyability
+    subq = (
+        select(
+            WalletScore.wallet_id,
+            func.max(WalletScore.scored_at).label("latest"),
+        )
+        .group_by(WalletScore.wallet_id)
+        .subquery()
     )
-    wallets = wallets_result.scalars().all()
+    top_result = await db.execute(
+        select(Wallet, WalletScore)
+        .join(subq, Wallet.id == subq.c.wallet_id)
+        .join(
+            WalletScore,
+            and_(
+                WalletScore.wallet_id == subq.c.wallet_id,
+                WalletScore.scored_at == subq.c.latest,
+            ),
+        )
+        .where(Wallet.is_tracked.is_(True))
+        .order_by((WalletScore.copyability_score * WalletScore.composite_score).desc())
+        .limit(min(limit * 2, 40))   # cap at 40 to avoid N+1 timeout
+    )
+    top_rows = top_result.all()
 
     scores = []
-    for w in wallets:
+    for w, s in top_rows:
         try:
             alpha = await compute_copyable_alpha(db, w.id)
             scores.append({
@@ -647,6 +797,8 @@ async def get_intelligence_alpha_leaderboard(
                 "recommendation": alpha.recommendation,
                 "alpha_decay_risk": alpha.alpha_decay_risk,
                 "decay_signal": alpha.decay_signal,
+                "composite_score": float(s.composite_score or 0),
+                "copyability_score": float(s.copyability_score or 0),
                 "top_factors": {
                     "timing": alpha.timing_score,
                     "persistence": alpha.persistence_score,

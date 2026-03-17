@@ -20,16 +20,21 @@ from datetime import datetime, timezone
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import get_settings, get_stale_market_blacklist
+from app.config import get_settings, get_stale_market_blacklist, get_wallet_blacklist
 from app.models.market import MarketSnapshot
 from app.models.paper import PaperPosition
 from app.models.signal import SignalDecision, TradeSignal
 
 # Cost regime — configurable via env for parameter sweeps
-MIN_CONF_EDGE = float(os.getenv("MIN_CONF_EDGE", "0.012"))   # 0.012 ≈ min_z 1.2 — fewer trades, higher quality
+MIN_CONF_EDGE = float(os.getenv("MIN_CONF_EDGE", "0.005"))
 MAX_SPREAD_TO_EDGE_RATIO = float(os.getenv("MAX_SPREAD_TO_EDGE", "0.6"))
-MAX_SPREAD_ABS = float(os.getenv("MAX_SPREAD_ABS", "0.03"))   # max 3% spread — edge erodes above this
+MAX_SPREAD_ABS = float(os.getenv("MAX_SPREAD_ABS", "0.08"))
 MIN_DEPTH_USD = float(os.getenv("MIN_DEPTH_USD", "100.0"))
+MIN_CALIBRATED_CONFIDENCE = float(os.getenv("MIN_CALIBRATED_CONFIDENCE", "0.05"))
+# Penny/extreme market filter: skip near-certain outcomes (price < 0.05 or > 0.95)
+# These are long-shot / near-resolved markets with near-zero real edge and high stale_data risk
+MIN_MARKET_PRICE = float(os.getenv("MIN_MARKET_PRICE", "0.05"))
+MAX_MARKET_PRICE = float(os.getenv("MAX_MARKET_PRICE", "0.95"))
 
 
 @dataclass
@@ -68,16 +73,22 @@ class SignalFilter:
         current_exposure_pct: float,
         latency_profile_id=None,
         slippage_profile_id=None,
+        snapshot_cache: dict | None = None,
+        position_counts: dict | None = None,
     ) -> FilterResult:
+        def _reason(code: str, detail: str) -> str:
+            return f"{code}: {detail}"
+
         now = datetime.now(timezone.utc)
         signal_age_ms = int((now - signal.created_at).total_seconds() * 1000)
         price_drift = current_price - float(signal.market_price) if signal.market_price else 0
+        cb = signal.costs_breakdown or {}
 
-        # For dislocation signals, trust the pre-computed net_edge
-        # For copy signals, recompute edge accounting for price drift since signal creation.
-        # SELL signals: raw_edge = model_prob - market_price is negative for shorts.
-        # We take abs() so edge is always measured as "distance from fair value" regardless of direction.
-        if signal.source_type == "spread_anomaly":
+        # Prefer standardized tradable edge from costs_breakdown (single source of truth).
+        # Fallback to legacy computation for backwards compatibility.
+        if cb.get("tradable_edge") is not None:
+            edge_at_decision = float(cb.get("tradable_edge"))
+        elif signal.source_type == "spread_anomaly":
             edge_at_decision = float(signal.net_edge or 0)
         else:
             raw_directional = float(signal.raw_edge or 0)
@@ -89,6 +100,8 @@ class SignalFilter:
         # Confidence-adjusted edge (primary quality gate)
         raw_conf = float(signal.model_confidence or 0.5)
         conf_adjusted_edge = edge_at_decision * raw_conf
+        calibrated_prob = float(cb.get("calibrated_probability", float(signal.model_probability or 0.5)))
+        calibrated_confidence = abs(calibrated_prob - 0.5) * 2 * raw_conf
 
         # Spread-to-edge ratio: how much of gross edge is consumed by spread alone
         spread_cost = current_spread / 2
@@ -97,13 +110,26 @@ class SignalFilter:
         else:
             spread_to_edge = float("inf")
 
-        # ── Gate 0: stale market blacklist (top offenders from stale-data-analytics) ─
         settings = get_settings()
+
+        # ── Gate 0a: wallet blacklist (manual blacklist from worst-by-copy-pnl) ─
+        if signal.source_wallet_id:
+            wallet_blacklist = get_wallet_blacklist(settings)
+            if wallet_blacklist and str(signal.source_wallet_id) in wallet_blacklist:
+                return FilterResult(
+                    decision="reject",
+                    reason=_reason("BLACKLIST_WALLET", "manual blacklist"),
+                    edge_at_decision=round(edge_at_decision, 6),
+                    price_drift=round(price_drift, 6),
+                    spread_at_decision=round(current_spread, 4),
+                )
+
+        # ── Gate 0: stale market blacklist (top offenders from stale-data-analytics) ─
         blacklist = get_stale_market_blacklist(settings)
         if blacklist and str(signal.market_id) in blacklist:
             return FilterResult(
                 decision="reject",
-                reason="market_blacklisted: high stale_data history",
+                reason=_reason("BLACKLIST_MARKET", "high stale_data history"),
                 edge_at_decision=round(edge_at_decision, 6),
                 price_drift=round(price_drift, 6),
                 spread_at_decision=round(current_spread, 4),
@@ -112,21 +138,27 @@ class SignalFilter:
         # ── Gate 0b: soft guard blocks NEW entries on stale snapshots ─
         # Existing positions are handled by exit_engine; this guard only prevents new entries.
         if settings.STALE_SOFT_GUARD and signal.market_id:
-            snap_q = await db.execute(
-                select(MarketSnapshot)
-                .where(MarketSnapshot.market_id == signal.market_id)
-                .order_by(MarketSnapshot.captured_at.desc())
-                .limit(1)
-            )
-            latest_snap = snap_q.scalar_one_or_none()
+            if snapshot_cache is not None:
+                latest_snap = snapshot_cache.get(signal.market_id)
+            else:
+                snap_q = await db.execute(
+                    select(MarketSnapshot)
+                    .where(MarketSnapshot.market_id == signal.market_id)
+                    .order_by(MarketSnapshot.captured_at.desc())
+                    .limit(1)
+                )
+                latest_snap = snap_q.scalar_one_or_none()
             if latest_snap and latest_snap.captured_at:
                 snap_age_h = (now - latest_snap.captured_at.replace(tzinfo=timezone.utc)).total_seconds() / 3600
                 if snap_age_h > float(settings.STALE_SNAPSHOT_HOURS):
                     return FilterResult(
                         decision="reject",
-                        reason=(
-                            f"stale_soft_guard_block_entry: snap_age_h={snap_age_h:.2f} "
-                            f"> threshold={float(settings.STALE_SNAPSHOT_HOURS):.2f}"
+                        reason=_reason(
+                            "FRESHNESS_STALE_SOFT_GUARD",
+                            (
+                                f"snap_age_h={snap_age_h:.2f} "
+                                f"> threshold={float(settings.STALE_SNAPSHOT_HOURS):.2f}"
+                            ),
                         ),
                         edge_at_decision=round(edge_at_decision, 6),
                         price_drift=round(price_drift, 6),
@@ -137,74 +169,118 @@ class SignalFilter:
         if signal_age_ms > self.max_signal_age_ms:
             return FilterResult(
                 decision="reject",
-                reason=f"signal_stale: {signal_age_ms}ms > {self.max_signal_age_ms}ms",
+                reason=_reason(
+                    "FRESHNESS_SIGNAL_STALE",
+                    f"{signal_age_ms}ms > {self.max_signal_age_ms}ms",
+                ),
                 edge_at_decision=round(edge_at_decision, 6),
                 price_drift=round(price_drift, 6),
                 spread_at_decision=round(current_spread, 4),
             )
 
-        # ── Gate 2: absolute spread cap ───────────────────────────────────────
-        if current_spread > self.max_spread:
+        # ── Gate 1b: extreme price filter (penny / near-resolved markets) ─────
+        # Prices < 5% or > 95% indicate near-certain outcomes — no real edge,
+        # high stale_data risk, and wallet ROI inflation when copying.
+        market_px = float(signal.market_price or 0.5)
+        if market_px < MIN_MARKET_PRICE or market_px > MAX_MARKET_PRICE:
             return FilterResult(
                 decision="reject",
-                reason=f"spread_too_wide: {current_spread:.4f} > {self.max_spread:.3f}",
+                reason=_reason(
+                    "EXTREME_MARKET_PRICE",
+                    f"price={market_px:.4f} outside [{MIN_MARKET_PRICE},{MAX_MARKET_PRICE}]",
+                ),
                 edge_at_decision=round(edge_at_decision, 6),
                 price_drift=round(price_drift, 6),
                 spread_at_decision=round(current_spread, 4),
             )
 
-        # ── Gate 3: confidence-adjusted edge minimum ──────────────────────────
+        # ── Gate 2: spread / liquidity gates (execution viability) ────────────
+        if current_spread > self.max_spread:            return FilterResult(
+                decision="reject",
+                reason=_reason(
+                    "EXEC_SPREAD_TOO_WIDE",
+                    f"{current_spread:.4f} > {self.max_spread:.3f}",
+                ),
+                edge_at_decision=round(edge_at_decision, 6),
+                price_drift=round(price_drift, 6),
+                spread_at_decision=round(current_spread, 4),
+            )
+
+        if available_depth_usd < self.min_liquidity_usd:
+            return FilterResult(
+                decision="reject",
+                reason=_reason(
+                    "EXEC_INSUFFICIENT_LIQUIDITY",
+                    f"${available_depth_usd:.0f} < ${self.min_liquidity_usd:.0f}",
+                ),
+                edge_at_decision=round(edge_at_decision, 6),
+                price_drift=round(price_drift, 6),
+                spread_at_decision=round(current_spread, 4),
+            )
+
+        # ── Gate 3: calibrated confidence gate ─────────────────────────────────
+        if calibrated_confidence < MIN_CALIBRATED_CONFIDENCE:
+            return FilterResult(
+                decision="reject",
+                reason=_reason(
+                    "CALIBRATED_CONFIDENCE_LOW",
+                    f"{calibrated_confidence:.4f} < {MIN_CALIBRATED_CONFIDENCE:.4f}",
+                ),
+                edge_at_decision=round(edge_at_decision, 6),
+                price_drift=round(price_drift, 6),
+                spread_at_decision=round(current_spread, 4),
+            )
+
+        # Keep legacy conf-edge gate after calibrated confidence.
         if conf_adjusted_edge < MIN_CONF_EDGE:
             return FilterResult(
                 decision="reject",
-                reason=f"conf_edge_low: {conf_adjusted_edge:.4f} < {MIN_CONF_EDGE:.4f}",
+                reason=_reason(
+                    "CONF_EDGE_LOW",
+                    f"{conf_adjusted_edge:.4f} < {MIN_CONF_EDGE:.4f}",
+                ),
                 edge_at_decision=round(edge_at_decision, 6),
                 price_drift=round(price_drift, 6),
                 spread_at_decision=round(current_spread, 4),
             )
 
-        # ── Gate 3b: executable edge (Layer 3 — fill_prob × liquidity) ────────
+        # ── Gate 4: executable edge (Layer 3 — fill_prob × liquidity) ─────────
         # Use pre-computed Layer-3 values stored in signal.costs_breakdown if available.
         # This prevents model edge inflation from passing even when conf_adj is borderline.
-        cb = signal.costs_breakdown or {}
-        liq_factor   = float(cb.get("liquidity_factor",   0.8))
-        fill_prob    = float(cb.get("fill_probability",   0.6))
-        exec_edge = conf_adjusted_edge * fill_prob * liq_factor
+        liq_factor = float(cb.get("liquidity_factor", 0.8))
+        fill_prob = float(cb.get("fill_probability", 0.6))
+        exec_edge = float(cb.get("executable_edge", conf_adjusted_edge * fill_prob * liq_factor))
         # Gate: executable edge must be positive (any negative = never executable)
         if exec_edge <= 0:
             return FilterResult(
                 decision="reject",
-                reason=f"exec_edge_nonpositive: {exec_edge:.5f}",
+                reason=_reason("EXEC_EDGE_NONPOSITIVE", f"{exec_edge:.5f}"),
                 edge_at_decision=round(edge_at_decision, 6),
                 price_drift=round(price_drift, 6),
                 spread_at_decision=round(current_spread, 4),
             )
 
-        # ── Gate 4: spread-to-edge ratio ─────────────────────────────────────
+        # ── Gate 5: spread-to-edge ratio ─────────────────────────────────────
         if spread_to_edge > MAX_SPREAD_TO_EDGE_RATIO:
             return FilterResult(
                 decision="reject",
-                reason=f"spread_eats_edge: ratio={spread_to_edge:.2f} > {MAX_SPREAD_TO_EDGE_RATIO}",
+                reason=_reason(
+                    "EXEC_SPREAD_EATS_EDGE",
+                    f"ratio={spread_to_edge:.2f} > {MAX_SPREAD_TO_EDGE_RATIO}",
+                ),
                 edge_at_decision=round(edge_at_decision, 6),
                 price_drift=round(price_drift, 6),
                 spread_at_decision=round(current_spread, 4),
             )
 
-        # ── Gate 5: net edge floor ─────────────────────────────────────────────
+        # ── Gate 6: net edge floor ─────────────────────────────────────────────
         if edge_at_decision <= self.min_net_edge:
             return FilterResult(
                 decision="reject",
-                reason=f"edge_eroded: {edge_at_decision:.4f} <= {self.min_net_edge}",
-                edge_at_decision=round(edge_at_decision, 6),
-                price_drift=round(price_drift, 6),
-                spread_at_decision=round(current_spread, 4),
-            )
-
-        # ── Gate 6: liquidity ─────────────────────────────────────────────────
-        if available_depth_usd < self.min_liquidity_usd:
-            return FilterResult(
-                decision="reject",
-                reason=f"insufficient_liquidity: ${available_depth_usd:.0f} < ${self.min_liquidity_usd:.0f}",
+                reason=_reason(
+                    "EDGE_ERODED",
+                    f"{edge_at_decision:.4f} <= {self.min_net_edge}",
+                ),
                 edge_at_decision=round(edge_at_decision, 6),
                 price_drift=round(price_drift, 6),
                 spread_at_decision=round(current_spread, 4),
@@ -217,24 +293,33 @@ class SignalFilter:
         if current_bankroll > 0 and current_exposure_pct > 0.12:
             return FilterResult(
                 decision="reject",
-                reason=f"max_exposure_exceeded: {current_exposure_pct:.2%} > 12%",
+                reason=_reason(
+                    "RISK_MAX_EXPOSURE_EXCEEDED",
+                    f"{current_exposure_pct:.2%} > 12%",
+                ),
                 edge_at_decision=round(edge_at_decision, 6),
                 price_drift=round(price_drift, 6),
                 spread_at_decision=round(current_spread, 4),
             )
 
         # ── Gate 8: market concentration ─────────────────────────────────────
-        market_positions = await db.execute(
-            select(func.count()).where(
-                PaperPosition.market_id == signal.market_id,
-                PaperPosition.status == "open",
+        if position_counts is not None:
+            pos_count = position_counts.get(signal.market_id, 0)
+        else:
+            market_positions = await db.execute(
+                select(func.count()).where(
+                    PaperPosition.market_id == signal.market_id,
+                    PaperPosition.status == "open",
+                )
             )
-        )
-        pos_count = market_positions.scalar() or 0
+            pos_count = market_positions.scalar() or 0
         if pos_count >= self.max_position_concentration:
             return FilterResult(
                 decision="reject",
-                reason=f"concentration_limit: {pos_count} >= {self.max_position_concentration} in market",
+                reason=_reason(
+                    "RISK_CONCENTRATION_LIMIT",
+                    f"{pos_count} >= {self.max_position_concentration} in market",
+                ),
                 edge_at_decision=round(edge_at_decision, 6),
                 price_drift=round(price_drift, 6),
                 spread_at_decision=round(current_spread, 4),

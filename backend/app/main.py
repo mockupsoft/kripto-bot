@@ -22,35 +22,86 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     assert_demo_mode(settings)
     setup_logging()
 
-    # Wrap polling in a resilient supervisor that restarts on crash
+    
+
+    # Task 1: Market + wallet ingestion loop
     async def _supervised_polling() -> None:
         backoff = 5
         while True:
             try:
                 from app.ingestion.live_ingestion import start_live_polling
-                await start_live_polling(market_interval=5, wallet_interval=45)
+                await start_live_polling(market_interval=5, wallet_interval=180)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.error(
-                    "Live polling crashed — restarting in %ds. Error: %s",
-                    backoff, exc,
-                )
+                logger.error("Live polling crashed — restarting in %ds. Error: %s", backoff, exc)
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 120)  # exponential back-off, cap at 2 min
+                backoff = min(backoff * 2, 120)
             else:
-                backoff = 5  # reset on clean exit
+                backoff = 5
+
+    # Task 2: Strategy runner — fully independent, every 30s
+    async def _supervised_runner() -> None:
+        backoff = 5
+        # Brief startup delay so DB/Redis are ready before first run
+        await asyncio.sleep(15)
+        from app.strategies.runner import StrategyRunner
+        from app.dependencies import async_session_factory
+        runner = StrategyRunner()
+        while True:
+            try:
+                async with async_session_factory() as db:
+                    stats = await runner.run_cycle(db)
+                    await db.commit()
+                logger.info(
+                    "Runner cycle: signals=%s trades=%s modes=%s",
+                    stats.get("signals_generated"),
+                    stats.get("trades_executed"),
+                    stats.get("strategy_modes"),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("Strategy runner crashed — restarting in %ds. Error: %s", backoff, exc)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+                continue
+            else:
+                backoff = 5
+            await asyncio.sleep(30)
+
+    # Task 3: Exit engine — every 60s
+    async def _supervised_exit() -> None:
+        await asyncio.sleep(20)
+        while True:
+            try:
+                from app.execution.exit_engine import run_exit_cycle
+                from app.dependencies import async_session_factory
+                async with async_session_factory() as db:
+                    result = await run_exit_cycle(db)
+                    await db.commit()
+                if result.get("closed", 0) > 0:
+                    logger.info("Exit engine closed %d positions", result["closed"])
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("Exit engine crashed: %s", exc)
+            await asyncio.sleep(60)
 
     polling_task = asyncio.create_task(_supervised_polling())
-    logger.info("Live Polymarket polling started (markets every 5s, wallets every 45s) — supervised mode")
+    runner_task = asyncio.create_task(_supervised_runner())
+    exit_task = asyncio.create_task(_supervised_exit())
+    logger.info("Live Polymarket polling started — supervised mode (polling + runner + exit engine)")
 
     yield
 
-    polling_task.cancel()
-    try:
-        await polling_task
-    except asyncio.CancelledError:
-        pass
+    for task in (polling_task, runner_task, exit_task):
+        task.cancel()
+    for task in (polling_task, runner_task, exit_task):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(

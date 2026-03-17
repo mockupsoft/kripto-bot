@@ -32,6 +32,7 @@ class ShadowModeStrategy(BaseStrategy):
         book_levels: dict | None,
         bankroll: float,
         exposure_pct: float,
+        **kwargs: object,
     ) -> SignalDecision | None:
         """Always logs the opportunity as 'shadow', never accepts for execution."""
         sizing = compute_position_size(

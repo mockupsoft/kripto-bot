@@ -1,9 +1,9 @@
 """Edge calculator: determines whether a detected dislocation has real positive EV.
 
 3-layer edge model (real prediction market approach):
-  Layer 1 — Fair Probability:   model_probability vs market_price  → raw_edge
-  Layer 2 — Tradable Edge:      raw_edge − spread − fee − slippage → net_edge
-  Layer 3 — Executable Edge:    net_edge × confidence × liquidity_factor → final edge
+  Layer 1 — Fair Probability:   model_probability vs market_price  -> raw_edge
+  Layer 2 — Tradable Edge:      raw_edge - spread - fee - slippage -> tradable_edge (net_edge)
+  Layer 3 — Executable Edge:    tradable_edge x confidence x fill_prob x liquidity_factor
 
 Edge inflation fix:
   - MAX_RAW_EDGE = 0.15: caps probability divergence (wallet_score circular logic blocker)
@@ -41,16 +41,19 @@ class EdgeResult:
     is_actionable: bool
 
 
-def calculate_polymarket_fee(price: float, fee_rate: float = 0.25, exponent: float = 2.0) -> float:
-    """Polymarket's fee formula: fee = C * p * feeRate * (p * (1-p))^exponent
+def calculate_polymarket_fee(price: float, fee_rate: float = 0.02) -> float:
+    """Polymarket fee per share: fee_rate * price * (1 - price).
 
     Fee peaks around p=0.5 and drops near 0 or 1.
-    C is a scaling constant; for simplicity we use C=2 as Polymarket does.
+    fee_rate: decimal (e.g. 0.02 for 2%).
     """
     if price <= 0 or price >= 1:
         return 0
-    C = 2.0
-    return C * price * fee_rate * (price * (1 - price)) ** exponent
+    return fee_rate * price * (1 - price)
+
+
+_DEFAULT_SLIPPAGE = float(os.getenv("EDGE_SLIPPAGE", "0.002"))
+_DEFAULT_FILL_RISK = float(os.getenv("EDGE_FILL_RISK", "0.001"))
 
 
 def calculate_edge(
@@ -60,10 +63,10 @@ def calculate_edge(
     fees_enabled: bool = True,
     fee_rate_bps: int = 250,
     spread: float = 0.02,
-    estimated_slippage: float = 0.005,
-    fill_risk_cost: float = 0.003,
-    available_depth_usd: float = 200.0,   # Layer 3 liquidity input
-    fill_probability: float | None = None,  # None = use BASE_FILL_PROBABILITY
+    estimated_slippage: float = _DEFAULT_SLIPPAGE,
+    fill_risk_cost: float = _DEFAULT_FILL_RISK,
+    available_depth_usd: float = 200.0,
+    fill_probability: float | None = None,
 ) -> EdgeResult:
     """Compute edge across 3 layers.
 
@@ -97,7 +100,7 @@ def calculate_edge(
 
     # ── Layer 2: Tradable Edge — subtract market structure costs ──────────────
     if fees_enabled:
-        fee = calculate_polymarket_fee(p, fee_rate=fee_rate_bps / 1000)
+        fee = calculate_polymarket_fee(p, fee_rate=fee_rate_bps / 10_000)
     else:
         fee = 0.0
 
@@ -129,9 +132,15 @@ def calculate_edge(
         "fill_risk": round(fill_risk_cost, 6),
         "total": round(total_cost, 6),
         "raw_edge_uncapped": round(raw_edge_uncapped, 6),
+        "raw_edge_capped": round(raw_edge, 6),
+        "tradable_edge": round(net_edge, 6),
+        "net_edge": round(net_edge, 6),  # alias for compatibility
+        "confidence_adjusted_edge": round(confidence_adjusted, 6),
+        "executable_edge": round(executable_edge, 6),
         "edge_was_capped": edge_capped,
         "liquidity_factor": round(liquidity_factor, 4),
-        "fill_probability": round(effective_fill_prob, 4),
+        "fill_probability": round(effective_fill_prob, 4),  # effective fill prob
+        "base_fill_probability": round(fp, 4),
     }
 
     return EdgeResult(

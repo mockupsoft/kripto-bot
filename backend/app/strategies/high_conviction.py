@@ -14,6 +14,7 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.execution.paper_executor import execute_paper_trade
 from app.models.paper import PaperPosition
 from app.models.signal import SignalDecision, TradeSignal
@@ -26,9 +27,11 @@ from app.strategies.base import BaseStrategy
 class HighConvictionCopyStrategy(BaseStrategy):
     name = "high_conviction"
 
-    def __init__(self, min_composite_score: float = 0.5, min_copyability: float = 0.4):
+    def __init__(self, min_composite_score: float | None = None, min_copyability: float = 0.4):
         self._filter = SignalFilter(min_net_edge=0.005, max_signal_age_ms=3000)
-        self._min_composite = min_composite_score
+        settings = get_settings()
+        # Use config value (same as direct_copy) if not explicitly overridden
+        self._min_composite = min_composite_score if min_composite_score is not None else float(settings.DIRECT_COPY_MIN_COMPOSITE)
         self._min_copyability = min_copyability
 
     async def evaluate(
@@ -41,6 +44,7 @@ class HighConvictionCopyStrategy(BaseStrategy):
         book_levels: dict | None,
         bankroll: float,
         exposure_pct: float,
+        **kwargs: object,
     ) -> SignalDecision | None:
         # Extra filter: check wallet quality
         if signal.source_wallet_id:
@@ -52,10 +56,10 @@ class HighConvictionCopyStrategy(BaseStrategy):
             )
             score = score_result.scalar_one_or_none()
 
-            if not score or (score.composite_score and float(score.composite_score) < self._min_composite):
+            if score is not None and score.composite_score is not None and float(score.composite_score) < self._min_composite:
                 result = FilterResult(
                     decision="reject",
-                    reason=f"wallet_score_below_threshold: {float(score.composite_score) if score and score.composite_score else 0:.2f} < {self._min_composite}",
+                    reason=f"wallet_score_below_threshold: {float(score.composite_score):.2f} < {self._min_composite}",
                     edge_at_decision=float(signal.net_edge or 0),
                     price_drift=0,
                     spread_at_decision=current_spread,
@@ -65,7 +69,7 @@ class HighConvictionCopyStrategy(BaseStrategy):
                     available_bankroll=bankroll, current_exposure_pct=exposure_pct,
                 )
 
-            if score and score.copyability_score and float(score.copyability_score) < self._min_copyability:
+            if score is not None and score.copyability_score is not None and float(score.copyability_score) < self._min_copyability:
                 result = FilterResult(
                     decision="reject",
                     reason=f"copyability_too_low: {float(score.copyability_score):.2f} < {self._min_copyability}",
@@ -82,6 +86,8 @@ class HighConvictionCopyStrategy(BaseStrategy):
             db=db, signal=signal, current_price=current_price,
             current_spread=current_spread, available_depth_usd=available_depth,
             current_bankroll=bankroll, current_exposure_pct=exposure_pct,
+            snapshot_cache=kwargs.get("snapshot_cache"),
+            position_counts=kwargs.get("position_counts"),
         )
 
         sizing = compute_position_size(

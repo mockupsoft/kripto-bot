@@ -117,7 +117,7 @@ async def execute_paper_trade(
         fill_price = 0
 
     # 5. Compute fee
-    fee = compute_fee(fill_price, actual_size, fees_enabled=fees_enabled, fee_rate=fee_rate_bps / 1000) if actual_size > 0 else 0
+    fee = compute_fee(fill_price, actual_size, fees_enabled=fees_enabled, fee_rate=fee_rate_bps / 10_000) if actual_size > 0 else 0
 
     # 6. Create order
     status = "filled" if fill_sim.is_full_fill else ("partial" if actual_size > 0 else "failed")

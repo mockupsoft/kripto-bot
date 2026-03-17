@@ -54,6 +54,9 @@ SPREAD_NORMALIZED_Z = 0.80
 
 # Wallet reversal: look back this many minutes for wallet activity
 WALLET_REVERSAL_LOOKBACK_MINUTES = 15
+# Minimum hold time before wallet_reversal can trigger — avoids closing
+# positions too quickly and guaranteeing a loss from fees + slippage.
+WALLET_REVERSAL_MIN_HOLD_MINUTES = 30
 
 # Strategy classification
 COPY_STRATEGIES = {"direct_copy", "high_conviction", "leader_copy", "shadow"}
@@ -198,6 +201,8 @@ async def _check_ev_compression(
         .where(
             TradeSignal.source_wallet_id == position.source_wallet_id,
             TradeSignal.market_id == position.market_id,
+            TradeSignal.strategy == (position.strategy or "direct_copy"),
+            TradeSignal.side == (position.side or "BUY"),
             TradeSignal.created_at >= cutoff,
             TradeSignal.created_at <= entry_time + timedelta(seconds=30),
         )
@@ -219,9 +224,15 @@ async def _check_ev_compression(
     if entry_price <= 0:
         return False
 
-    # Simplified current edge: original model_prob minus current price minus spread/2
+    # Current edge depends on position direction:
+    # BUY: we profit when price rises → edge = model_prob - current_price - spread/2
+    # SELL: we profit when price falls → edge = current_price - model_prob - spread/2
     model_prob = float(signal.model_probability or entry_price)
-    current_edge = model_prob - current_price - (current_spread / 2)
+    pos_side = (position.side or "BUY").upper()
+    if pos_side == "SELL":
+        current_edge = current_price - model_prob - (current_spread / 2)
+    else:
+        current_edge = model_prob - current_price - (current_spread / 2)
 
     if current_edge < entry_edge * EV_COMPRESSION_THRESHOLD:
         logger.info(
@@ -361,21 +372,27 @@ async def run_exit_cycle(db: AsyncSession) -> dict[str, Any]:
             settings = get_settings()
             stale_threshold = float(settings.STALE_SNAPSHOT_HOURS)
             snap_age_h = (now - snap.captured_at.replace(tzinfo=timezone.utc)).total_seconds() / 3600
-            if snap_age_h > stale_threshold:
-                if settings.STALE_EXIT_DISABLED or settings.STALE_SOFT_GUARD:
-                    logger.info(
-                        f"stale_data skipped (soft_guard/disabled): pos={pos.id} snap_age_h={snap_age_h:.2f}h "
-                        f"threshold={stale_threshold}h market={pos.market_id}"
-                    )
-                else:
-                    logger.info(
-                        f"stale_data exit: pos={pos.id} snap_age_h={snap_age_h:.2f} "
-                        f"threshold={stale_threshold}h market={pos.market_id}"
-                    )
-                    info = await close_position(db, pos, entry, "stale_data")
-                    closed.append(info)
-                    already_closed_this_cycle.add(pos.id)
+            is_stale = snap_age_h > stale_threshold
+
+            if is_stale and not settings.STALE_EXIT_DISABLED and not settings.STALE_SOFT_GUARD:
+                # Use last known price from stale snapshot, not entry — closing at entry
+                # would lock in realized_pnl = -fees - slippage (guaranteed loss) while
+                # the wallet may still hold and later close in profit.
+                exit_price_stale = float(snap.midpoint or snap.last_trade_price or entry)
+                logger.info(
+                    f"stale_data exit: pos={pos.id} snap_age_h={snap_age_h:.2f} "
+                    f"threshold={stale_threshold}h market={pos.market_id}"
+                )
+                info = await close_position(db, pos, exit_price_stale, "stale_data")
+                closed.append(info)
+                already_closed_this_cycle.add(pos.id)
                 continue
+            elif is_stale:
+                logger.info(
+                    f"stale_data skipped (soft_guard/disabled): pos={pos.id} snap_age_h={snap_age_h:.2f}h "
+                    f"threshold={stale_threshold}h market={pos.market_id}"
+                )
+                # Soft guard: block stale EXIT but still check stop_loss/target/reversal below
 
             current_price = float(snap.midpoint or snap.last_trade_price or entry)
             current_spread = float(snap.spread or 0.04)
@@ -383,12 +400,13 @@ async def run_exit_cycle(db: AsyncSession) -> dict[str, Any]:
             # ── Strategy-specific smart exits ─────────────────────────────────
 
             if strategy in COPY_STRATEGIES:
-                # Rule A: Wallet reversal (copy strategies only)
-                if await _check_wallet_reversal(db, pos, now):
-                    info = await close_position(db, pos, current_price, "wallet_reversal")
-                    closed.append(info)
-                    already_closed_this_cycle.add(pos.id)
-                    continue
+                hold_minutes = (now - pos.opened_at.replace(tzinfo=timezone.utc)).total_seconds() / 60
+                if hold_minutes >= WALLET_REVERSAL_MIN_HOLD_MINUTES:
+                    if await _check_wallet_reversal(db, pos, now):
+                        info = await close_position(db, pos, current_price, "wallet_reversal")
+                        closed.append(info)
+                        already_closed_this_cycle.add(pos.id)
+                        continue
 
             elif strategy in DISLOCATION_STRATEGIES:
                 # Rule B: Spread normalized (dislocation only)

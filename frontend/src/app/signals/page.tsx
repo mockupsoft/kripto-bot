@@ -11,6 +11,7 @@ const POLL_INTERVAL_MS = 8000;
 const STRATEGY_COLORS: Record<string, string> = {
   direct_copy: 'bg-blue-500/15 text-blue-400',
   high_conviction: 'bg-purple-500/15 text-purple-400',
+  leader_copy: 'bg-teal-500/15 text-teal-400',
   dislocation: 'bg-amber-500/15 text-amber-400',
   shadow: 'bg-gray-500/15 text-gray-400',
 };
@@ -258,7 +259,7 @@ export default function SignalsPage() {
   };
 
   const totalPages = Math.ceil(total / PAGE_SIZE);
-  const strategies = ['direct_copy', 'high_conviction', 'dislocation', 'shadow'];
+  const strategies = ['direct_copy', 'high_conviction', 'leader_copy', 'dislocation', 'shadow'];
   const sourceTypes = ['wallet_copy', 'spread_anomaly'];
 
   return (

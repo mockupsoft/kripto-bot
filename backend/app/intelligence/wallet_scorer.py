@@ -56,8 +56,19 @@ async def score_wallet(db: AsyncSession, wallet_id) -> ScoringResult:
     wins = [p for p in profits if p > 0]
     losses = [p for p in profits if p <= 0]
 
-    total_roi = sum(profits) / max(sum(notionals), 1) if notionals else 0
-    hit_rate = len(wins) / max(len(profits), 1)
+    # ROI: cap denominator to prevent penny-position inflation
+    # If a wallet trades at <0.05, notional is tiny → ROI explodes artificially.
+    # Use max(sum(notionals), MIN_NOTIONAL_FLOOR) to dampen this.
+    MIN_NOTIONAL_FLOOR = 1.0   # $1 minimum notional floor for ROI calculation
+    total_roi = sum(profits) / max(sum(notionals) if notionals else 0, MIN_NOTIONAL_FLOOR)
+
+    # hit_rate: only count non-trivial trades (price between 0.05–0.95)
+    meaningful_profits = [p for p, t in zip(profits, txs)
+                          if float(t.price or 0.5) >= 0.05 and float(t.price or 0.5) <= 0.95]
+    if meaningful_profits:
+        hit_rate = len([p for p in meaningful_profits if p > 0]) / len(meaningful_profits)
+    else:
+        hit_rate = 0.5  # no meaningful trades → neutral score
     avg_position_size = np.mean(sizes) if sizes else 0
     avg_hold = _avg_hold_time(txs)
     max_dd = _max_drawdown(profits)
@@ -151,15 +162,40 @@ async def score_and_persist(db: AsyncSession, wallet_id) -> WalletScore:
     )
     db.add(ws)
     await db.flush()
+
+    # Keep only the 3 most recent score rows per wallet to prevent table bloat
+    old_scores = await db.execute(
+        select(WalletScore)
+        .where(WalletScore.wallet_id == wallet_id)
+        .order_by(WalletScore.scored_at.desc())
+        .offset(3)
+    )
+    for old in old_scores.scalars().all():
+        await db.delete(old)
+
     return ws
 
 
 def _estimate_profits(txs: list) -> list[float]:
-    """Simple heuristic: BUYs at price p; if outcome resolves to Yes and p < 0.5, profit."""
+    """Estimate per-trade profit using price-based heuristic.
+
+    For very cheap positions (price < 0.05), profit is near-zero regardless
+    of side — these are long-shot bets, not directional alpha.
+    A BUY at 0.001 is NOT a win just because price < 0.55.
+    """
     profits = []
     for t in txs:
         price = float(t.price) if t.price else 0.5
         size = float(t.size) if t.size else 0
+        notional = float(t.notional) if t.notional else (price * size)
+
+        # Long-shot positions (price < 0.05 or > 0.95): minimal edge
+        # The market has near-certain outcome priced in — copy edge is negligible
+        if price < 0.05 or price > 0.95:
+            # Treat as near-zero expected profit; neither win nor loss heuristically
+            profits.append(0.0)
+            continue
+
         if t.side == "BUY":
             implied_profit = (0.55 - price) * size
         else:
@@ -236,9 +272,12 @@ def _compute_copy_decay(txs: list, prices: list, detection_lags: list) -> dict[s
 
     Uses detection_lag_ms distribution to model how quickly price moves
     after the wallet trades, eroding the available edge.
+
+    If no lag data: return pessimistic defaults (we don't know if copyable).
     """
     if not detection_lags or not prices:
-        return {"200ms": 0.5, "500ms": 0.4, "1000ms": 0.3, "1500ms": 0.2}
+        # No lag data — we can't assess copyability; use conservative defaults
+        return {"200ms": 0.3, "500ms": 0.2, "1000ms": 0.1, "1500ms": 0.05}
 
     avg_price = np.mean(prices)
     avg_edge = abs(avg_price - 0.5) * 2  # rough edge proxy

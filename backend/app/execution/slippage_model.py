@@ -19,9 +19,9 @@ class SlippageResult:
 def estimate_slippage(
     base_price: float,
     side: str,
-    base_slippage_bps: int = 20,
-    volatility_multiplier: float = 1.5,
-    depth_factor: float = 0.5,
+    base_slippage_bps: int = 5,
+    volatility_multiplier: float = 0.5,
+    depth_factor: float = 0.3,
     current_volatility: float = 0.05,
     available_depth: float = 100.0,
     requested_size: float = 50.0,

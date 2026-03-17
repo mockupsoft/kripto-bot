@@ -7,15 +7,21 @@ simulate copying with capped size, exit on configurable conditions.
 
 from __future__ import annotations
 
+import logging
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.execution.paper_executor import execute_paper_trade
 from app.models.paper import PaperPosition
 from app.models.signal import SignalDecision, TradeSignal
+from app.models.wallet import WalletScore
 from app.risk.exposure_manager import check_exposure, get_current_bankroll
 from app.risk.position_sizer import compute_position_size
 from app.signals.signal_filter import FilterResult, SignalFilter
 from app.strategies.base import BaseStrategy
+
+logger = logging.getLogger(__name__)
 
 
 class DirectCopyStrategy(BaseStrategy):
@@ -23,6 +29,9 @@ class DirectCopyStrategy(BaseStrategy):
 
     def __init__(self):
         self._filter = SignalFilter(min_net_edge=0.0, max_signal_age_ms=5000)
+        settings = get_settings()
+        self._min_composite = float(settings.DIRECT_COPY_MIN_COMPOSITE)
+        self._min_copyability = float(settings.DIRECT_COPY_MIN_COPYABILITY)
 
     async def evaluate(
         self,
@@ -34,7 +43,60 @@ class DirectCopyStrategy(BaseStrategy):
         book_levels: dict | None,
         bankroll: float,
         exposure_pct: float,
+        **kwargs: object,
     ) -> SignalDecision | None:
+        wallet_score_cache: dict[str, tuple[float, float]] | None = kwargs.get("wallet_score_cache")
+
+        # Wallet gate: reject low-quality wallets (skip if no source_wallet_id)
+        if signal.source_wallet_id:
+            composite: float | None = None
+            copyability: float | None = None
+            wid = str(signal.source_wallet_id)
+            if wallet_score_cache and wid in wallet_score_cache:
+                composite, copyability = wallet_score_cache[wid]
+            else:
+                ws_result = await db.execute(
+                    select(WalletScore)
+                    .where(WalletScore.wallet_id == signal.source_wallet_id)
+                    .order_by(WalletScore.scored_at.desc())
+                    .limit(1)
+                )
+                ws = ws_result.scalar_one_or_none()
+                if ws:
+                    composite = float(ws.composite_score or 0) if ws.composite_score is not None else 0.0
+                    copyability = float(ws.copyability_score or 0) if ws.copyability_score is not None else 0.0
+                else:
+                    logger.debug("wallet_score_missing for %s, proceeding", wid[:8])
+                    # Missing score: do NOT reject; veri boşluğu != kötü kalite
+
+            if composite is not None:
+                if composite < self._min_composite:
+                    reason = f"wallet_score_below_threshold: composite={composite:.2f} min={self._min_composite}"
+                    result = FilterResult(
+                        decision="reject",
+                        reason=reason,
+                        edge_at_decision=float(signal.net_edge or 0),
+                        price_drift=0,
+                        spread_at_decision=current_spread,
+                    )
+                    return await self._filter.record_decision(
+                        db=db, signal=signal, result=result,
+                        available_bankroll=bankroll, current_exposure_pct=exposure_pct,
+                    )
+                if self._min_copyability > 0 and copyability is not None and copyability < self._min_copyability:
+                    reason = f"wallet_score_below_threshold: copyability={copyability:.2f} min={self._min_copyability}"
+                    result = FilterResult(
+                        decision="reject",
+                        reason=reason,
+                        edge_at_decision=float(signal.net_edge or 0),
+                        price_drift=0,
+                        spread_at_decision=current_spread,
+                    )
+                    return await self._filter.record_decision(
+                        db=db, signal=signal, result=result,
+                        available_bankroll=bankroll, current_exposure_pct=exposure_pct,
+                    )
+
         result = await self._filter.evaluate(
             db=db,
             signal=signal,
@@ -43,6 +105,8 @@ class DirectCopyStrategy(BaseStrategy):
             available_depth_usd=available_depth,
             current_bankroll=bankroll,
             current_exposure_pct=exposure_pct,
+            snapshot_cache=kwargs.get("snapshot_cache"),
+            position_counts=kwargs.get("position_counts"),
         )
 
         sizing = compute_position_size(

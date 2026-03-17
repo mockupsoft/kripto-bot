@@ -30,8 +30,9 @@ class BaseStrategy(ABC):
         book_levels: dict | None,
         bankroll: float,
         exposure_pct: float,
+        **kwargs: object,
     ) -> SignalDecision | None:
-        """Evaluate a signal and decide whether to act on it."""
+        """Evaluate a signal and decide whether to act on it. kwargs may include wallet_score_cache."""
         ...
 
     @abstractmethod

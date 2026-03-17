@@ -172,6 +172,10 @@ async def get_rolling_stats(
         and pf >= cfg.restore_pf_threshold
     ):
         mode = "active"   # auto-restore
+    # Research mode: shadow strategies that have never traded get a small trial allocation
+    # so they can accumulate data and eventually auto-restore
+    elif _RESEARCH_MODE and cfg.default_mode == "shadow" and trade_count == 0:
+        mode = "active"
 
     # Capital share: proportional to PF, bounded by config
     # Hard cap: no single strategy may control more than 60% of bankroll

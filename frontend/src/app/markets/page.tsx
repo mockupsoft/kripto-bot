@@ -385,7 +385,7 @@ function ActionCard({ item }: { item: ActionItem }) {
               <span>Price A: <span className="text-gray-200">{item.price_a.toFixed(4)}</span></span>
               <span>Price B: <span className="text-gray-200">{item.price_b.toFixed(4)}</span></span>
               <span>Fair value: <span className="text-gray-200">{item.fair_value.toFixed(4)}</span></span>
-              <span>Raw edge: <span className="text-emerald-400">+{item.raw_edge.toFixed(4)}</span></span>
+              <span>Raw edge: <span className={item.raw_edge >= 0 ? 'text-emerald-400' : 'text-red-400'}>{item.raw_edge > 0 ? '+' : ''}{item.raw_edge.toFixed(4)}</span></span>
               <span>Total cost: <span className="text-amber-400">-{item.total_cost.toFixed(4)}</span></span>
               <span>Net edge: <span className={item.net_edge > 0 ? 'text-emerald-400' : 'text-red-400'}>{item.net_edge > 0 ? '+' : ''}{item.net_edge.toFixed(4)}</span></span>
               <span>Staleness HC: <span className="text-gray-300">{(item.staleness_haircut * 100).toFixed(0)}%</span></span>

@@ -15,19 +15,18 @@ Kill-switch: if last 20 trades PF < 0.8 → strategy enters shadow mode.
 from __future__ import annotations
 
 import logging
+import os
 import random
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.analytics.pnl import compute_portfolio_snapshot
-from app.ingestion.event_normalizer import process_pending_events
-from app.intelligence.wallet_scorer import score_and_persist
-from app.intelligence.wallet_tracker import detect_new_trades, get_tracked_wallets
+from app.intelligence.wallet_tracker import get_tracked_wallets
 from app.models.market import Market, MarketRelationship, MarketSnapshot
+from app.models.paper import PaperPosition
 from app.models.signal import TradeSignal
-from app.models.trade import WalletTransaction
 from app.models.wallet import WalletScore
 from app.risk.exposure_manager import check_exposure, get_current_bankroll
 from app.risk.kill_switch import check_kill_switch
@@ -52,6 +51,9 @@ class StrategyRunner:
             "dislocation": DislocationStrategy(),
             "shadow": ShadowModeStrategy(),
         }
+        # Track last run time to bound trade window (avoid reprocessing old trades)
+        # Start with recent timestamp so first cycle only processes very fresh trades
+        self._last_run_at: datetime = datetime.now(timezone.utc) - timedelta(seconds=60)
 
     async def run_cycle(self, db: AsyncSession) -> dict:
         """Execute one full processing cycle."""
@@ -73,19 +75,37 @@ class StrategyRunner:
             },
         }
 
-        # 1. Process pending raw events into domain tables
-        stats["events_processed"] = await process_pending_events(db)
+        # Event normalization handled by ingestion loop — not runner's responsibility
 
-        # 2. Check global kill switch
-        kill = await check_kill_switch(db)
-        if kill.is_active:
-            stats["kill_switch"] = kill.reason
-            return stats
+        # 2. Check global kill switch (skip in research mode)
+        _research_mode = os.getenv("STRATEGY_RESEARCH_MODE", "").lower() in ("true", "1", "yes")
+        if not _research_mode:
+            kill = await check_kill_switch(db)
+            if kill.is_active:
+                stats["kill_switch"] = kill.reason
+                return stats
 
-        # 3. Score tracked wallets
+        # 3. Load tracked wallets (scoring is done externally by live_ingestion)
         wallets = await get_tracked_wallets(db)
-        for w in wallets:
-            await score_and_persist(db, w.id)
+
+        # 3b. Batch preload latest wallet scores for copy strategies (cache-first lookup)
+        wallet_ids = [w.id for w in wallets]
+        wallet_score_cache: dict[str, tuple[float, float]] = {}
+        if wallet_ids:
+            subq = (
+                select(WalletScore.wallet_id, func.max(WalletScore.scored_at).label("latest"))
+                .group_by(WalletScore.wallet_id)
+                .subquery()
+            )
+            score_rows = await db.execute(
+                select(WalletScore)
+                .join(subq, (WalletScore.wallet_id == subq.c.wallet_id) & (WalletScore.scored_at == subq.c.latest))
+                .where(WalletScore.wallet_id.in_(wallet_ids))
+            )
+            for ws in score_rows.scalars().all():
+                composite = float(ws.composite_score or 0) if ws.composite_score is not None else 0.0
+                copyability = float(ws.copyability_score or 0) if ws.copyability_score is not None else 0.0
+                wallet_score_cache[str(ws.wallet_id)] = (composite, copyability)
 
         # 4. Total bankroll (used for capital weighting)
         total_bankroll = await get_current_bankroll(db)
@@ -101,41 +121,83 @@ class StrategyRunner:
             is_active = brl > 0
             stats["strategy_modes"][sname] = "active" if is_active else "shadow/paused"
 
-        # 5. Detect new trades from tracked wallets — with alpha decay gate
-        since_cutoff = datetime.now(timezone.utc) - timedelta(minutes=2)
+        # 5. Batch-fetch new trades for all eligible wallets in one query
+        now_utc = datetime.now(timezone.utc)
+        since_cutoff = self._last_run_at - timedelta(seconds=10)
+        self._last_run_at = now_utc
+        _MIN_RUNNER_COMPOSITE = float(os.getenv("RUNNER_MIN_COMPOSITE", "0.35"))
 
+        # Filter wallets by gate
+        eligible_wallets = []
         for w in wallets:
-            # Alpha decay kill-switch: skip wallet if decay risk is critical
-            try:
-                from app.intelligence.wallet_alpha import detect_alpha_decay
-                decay = await detect_alpha_decay(db, w.id)
-                if decay.get("decay_alert") and decay.get("reason", "") != "insufficient_data":
-                    # Decay detected — still allow direct_copy but skip leader_copy
-                    decay_skip_strategies = {"leader_copy", "high_conviction"}
-                else:
-                    decay_skip_strategies = set()
-            except Exception:
-                decay_skip_strategies = set()
-            new_trades = await detect_new_trades(db, w.id, since=since_cutoff)
-            # Only process trades that are linked to a known market
-            new_trades = [t for t in new_trades if t.market_id is not None]
+            w_composite_cached = wallet_score_cache.get(str(w.id), (0.0, 0.0))[0]
+            if w_composite_cached > 0 and w_composite_cached < _MIN_RUNNER_COMPOSITE:
+                continue
+            eligible_wallets.append(w)
 
-            # Fetch latest wallet score for Bayesian signal injection
-            ws_result = await db.execute(
-                select(WalletScore)
-                .where(WalletScore.wallet_id == w.id)
-                .order_by(WalletScore.scored_at.desc())
-                .limit(1)
+        # Pre-fetch global exposure state once (avoid per-signal DB hit)
+        open_pos_result = await db.execute(
+            select(PaperPosition).where(PaperPosition.status == "open")
+        )
+        open_positions_cache = list(open_pos_result.scalars().all())
+        global_pos_count = len(open_positions_cache)
+        global_exposure_usd = sum(float(p.total_cost or 0) for p in open_positions_cache)
+        global_exposure_pct = global_exposure_usd / max(total_bankroll, 1)
+        _MAX_GLOBAL = int(os.getenv("MAX_OPEN_POSITIONS_GLOBAL", "20"))
+
+        # Build position counts per market (for concentration gate in signal_filter)
+        position_counts_preloaded: dict = {}
+        for p in open_positions_cache:
+            position_counts_preloaded[p.market_id] = position_counts_preloaded.get(p.market_id, 0) + 1
+
+        # Single batch query for all new trades
+        from app.intelligence.wallet_tracker import detect_new_trades_batch
+        wallet_trades_map = await detect_new_trades_batch(
+            db,
+            wallet_ids=[w.id for w in eligible_wallets],
+            since=since_cutoff,
+            limit_per_wallet=1,  # 1 trade per wallet per cycle — prevents signal flood
+        )
+
+        # Batch preload snapshots and markets for all wallets with trades
+        all_market_ids = list({
+            tx.market_id
+            for trades in wallet_trades_map.values()
+            for tx in trades
+        })
+        snap_cache: dict = {}
+        mkt_cache: dict = {}
+        if all_market_ids:
+            snap_subq = (
+                select(MarketSnapshot.market_id, func.max(MarketSnapshot.captured_at).label("latest"))
+                .group_by(MarketSnapshot.market_id)
+                .where(MarketSnapshot.market_id.in_(all_market_ids))
+                .subquery()
             )
-            ws = ws_result.scalar_one_or_none()
-            w_composite = float(ws.composite_score or 0.5) if ws else 0.5
+            snap_rows = await db.execute(
+                select(MarketSnapshot)
+                .join(snap_subq, (MarketSnapshot.market_id == snap_subq.c.market_id) & (MarketSnapshot.captured_at == snap_subq.c.latest))
+            )
+            snap_cache = {s.market_id: s for s in snap_rows.scalars().all()}
 
-            for tx in new_trades[:2]:  # max 2 trades per wallet per cycle — prevents position flood
-                snap = await _get_latest_snapshot(db, tx.market_id)
+            mkt_rows = await db.execute(select(Market).where(Market.id.in_(all_market_ids)))
+            mkt_cache = {m.id: m for m in mkt_rows.scalars().all()}
+
+        for w in eligible_wallets:
+            # Use cached composite score
+            w_composite = wallet_score_cache.get(str(w.id), (0.0, 0.0))[0]
+            if w_composite <= 0:
+                w_composite = 0.5
+            decay_skip_strategies: set[str] = set()
+
+            new_trades = wallet_trades_map.get(w.id, [])
+
+            for tx in new_trades:
+                snap = snap_cache.get(tx.market_id)
                 if not snap:
                     continue
 
-                market = await db.get(Market, tx.market_id)
+                market = mkt_cache.get(tx.market_id)
                 if not market:
                     continue
 
@@ -144,31 +206,43 @@ class StrategyRunner:
                 current_depth  = float(snap.bid_depth or 200.0)
 
                 for strat_name in copy_strategies:
-                    # Alpha decay kill-switch: skip high-conviction strategies for decaying wallets
                     if strat_name in decay_skip_strategies:
                         continue
                     strat_bankroll = strategy_bankrolls.get(strat_name, total_bankroll)
-                    # Skip shadow/paused strategies entirely — no signal generation, no DB noise
                     if strat_bankroll <= 0 and strat_name != "shadow":
                         continue
 
-                    signal = await self.signal_gen.generate_copy_signal(
-                        db=db,
-                        strategy=strat_name,
-                        wallet_id=w.id,
-                        market_id=tx.market_id,
-                        market_price=current_price,
-                        fees_enabled=market.fees_enabled,
-                        fee_rate_bps=market.fee_rate_bps,
-                        spread=current_spread,
-                        wallet_score=w_composite,
-                        available_depth_usd=current_depth,   # Layer-3 liquidity input
-                    )
+                    tx_side = getattr(tx, "side", None) or "BUY"
+                    try:
+                        signal = await self.signal_gen.generate_copy_signal(
+                            db=db,
+                            strategy=strat_name,
+                            wallet_id=w.id,
+                            market_id=tx.market_id,
+                            market_price=current_price,
+                            fees_enabled=market.fees_enabled,
+                            fee_rate_bps=market.fee_rate_bps,
+                            spread=current_spread,
+                            wallet_side=tx_side,
+                            wallet_score=w_composite,
+                            available_depth_usd=current_depth,
+                        )
+                    except Exception as gen_err:
+                        logger.warning("Signal gen error %s/%s: %s", strat_name, str(w.id)[:8], gen_err)
+                        continue
                     stats["signals_generated"] += 1
                     stats["strategy_funnel"][strat_name]["signals_generated"] += 1
 
-                    strat   = self.strategies[strat_name]
-                    exposure = await check_exposure(db, tx.market_id, 50, strat_bankroll, wallet_id=w.id)
+                    # Strategies with bankroll=0 or heavy per-wallet compute: skip evaluation
+                    # leader_copy.evaluate() runs compute_copyable_alpha per wallet (very expensive)
+                    _SKIP_EVALUATE = {"shadow", "leader_copy"}
+                    if strat_bankroll <= 0 or strat_name in _SKIP_EVALUATE:
+                        continue
+
+                    strat = self.strategies[strat_name]
+
+                    if global_pos_count >= _MAX_GLOBAL:
+                        continue
 
                     try:
                         decision = await strat.evaluate(
@@ -179,7 +253,10 @@ class StrategyRunner:
                             available_depth=float(snap.bid_depth or 100),
                             book_levels=snap.book_levels,
                             bankroll=strat_bankroll,
-                            exposure_pct=exposure.current_exposure_pct,
+                            exposure_pct=global_exposure_pct,
+                            wallet_score_cache=wallet_score_cache,
+                            snapshot_cache=snap_cache,
+                            position_counts=position_counts_preloaded,
                         )
                     except Exception as eval_err:
                         logger.warning(f"{strat_name} evaluate error: {eval_err}")

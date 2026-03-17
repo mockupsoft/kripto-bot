@@ -37,6 +37,18 @@ class Settings(BaseSettings):
     STOP_LOSS_PCT: float = 0.10           # was 0.08 — "edge var ama sabır yok"; 10% gives more room
     STALE_MARKET_BLACKLIST: str = ""     # comma-separated market UUIDs; from top_markets_by_stale_count
 
+    # Direct copy wallet gate (Phase 1)
+    DIRECT_COPY_MIN_COMPOSITE: float = 0.35   # high_conviction 0.5'tan daha gevşek
+    DIRECT_COPY_MIN_COPYABILITY: float = 0.0  # Phase 1'de sadece composite; tek değişken deneyi
+
+    # Wallet blacklist (Phase 2) — comma-separated wallet UUIDs; from worst-by-copy-pnl
+    WALLET_BLACKLIST: str = ""
+
+    # Wallet influence in Bayesian (A/B test: reduce double-counting)
+    # Default 0.6/0.5; test branch: 0.3/0.25 for healthier distribution
+    WALLET_IMBALANCE_FACTOR: float = 0.6
+    WALLET_REPRICING_FACTOR: float = 0.5
+
 
 class DemoModeViolation(RuntimeError):
     """Raised when any code path attempts real-money operations."""
@@ -58,6 +70,14 @@ def compute_config_hash(config: dict) -> str:
 def get_stale_market_blacklist(settings: Settings) -> frozenset[str]:
     """Parse STALE_MARKET_BLACKLIST into set of market IDs for fast lookup."""
     raw = (settings.STALE_MARKET_BLACKLIST or "").strip()
+    if not raw:
+        return frozenset()
+    return frozenset(m.strip() for m in raw.split(",") if m.strip())
+
+
+def get_wallet_blacklist(settings: Settings) -> frozenset[str]:
+    """Parse WALLET_BLACKLIST into set of wallet IDs for fast lookup."""
+    raw = (settings.WALLET_BLACKLIST or "").strip()
     if not raw:
         return frozenset()
     return frozenset(m.strip() for m in raw.split(",") if m.strip())
