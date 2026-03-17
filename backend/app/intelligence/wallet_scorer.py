@@ -93,7 +93,7 @@ async def score_wallet(db: AsyncSession, wallet_id) -> ScoringResult:
     classification = _classify(hit_rate, total_roi, avg_hold, suspiciousness, len(txs))
 
     # Copy decay curve: estimate edge remaining at different latencies
-    decay_curve = _compute_copy_decay(txs, prices, detection_lags)
+    decay_curve = _compute_copy_decay(txs, prices, detection_lags, hit_rate, total_roi)
 
     # Copyability: weighted average of decay at realistic latencies
     decay_values = list(decay_curve.values())
@@ -267,32 +267,43 @@ def _classify(hit_rate: float, roi: float, avg_hold: int, suspiciousness: float,
     return "unknown"
 
 
-def _compute_copy_decay(txs: list, prices: list, detection_lags: list) -> dict[str, float]:
-    """Estimate what fraction of edge remains at various copy latencies.
+def _compute_copy_decay(
+    txs: list, prices: list, detection_lags: list,
+    hit_rate: float = 0.5, total_roi: float = 0.0,
+) -> dict[str, float]:
+    """Estimate copyability at various copy latencies.
 
-    Uses detection_lag_ms distribution to model how quickly price moves
-    after the wallet trades, eroding the available edge.
+    Combines two independent factors:
+      - edge_factor (70%): performance-based quality from hit_rate + ROI
+      - latency_factor (30%): exponential decay modulated by detection lag
 
-    If no lag data: return pessimistic defaults (we don't know if copyable).
+    Latency component is down-weighted because current lag data comes from
+    bulk ingestion rather than real-time detection.
     """
     if not detection_lags or not prices:
-        # No lag data — we can't assess copyability; use conservative defaults
         return {"200ms": 0.3, "500ms": 0.2, "1000ms": 0.1, "1500ms": 0.05}
 
-    avg_price = np.mean(prices)
-    avg_edge = abs(avg_price - 0.5) * 2  # rough edge proxy
+    # Performance-based edge [0, 1]: hit_rate quality + ROI signal
+    hit_component = max(0.0, (hit_rate - 0.3) * 1.43)
+    roi_boost = max(0.0, min(0.2, total_roi * 0.4))
+    edge_factor = min(1.0, hit_component + roi_boost)
+
+    median_lag = np.median(detection_lags)
+    # Continuous decay modulated by median lag (log scale for wide range)
+    # Lower lag → market reacts faster → edge erodes quicker at high latencies
+    lag_log = math.log(max(median_lag, 100))
+    lag_norm = 1.0 - min(1.0, (lag_log - 4.6) / 8.3)
+    decay_rate = 0.0002 + lag_norm * 0.0008
+
+    EDGE_WEIGHT = 0.7
+    LATENCY_WEIGHT = 0.3
 
     latency_points = {"200ms": 200, "500ms": 500, "1000ms": 1000, "1500ms": 1500}
-    median_lag = np.median(detection_lags)
-
     curve = {}
     for label, ms in latency_points.items():
-        # Edge decays exponentially with copy latency
-        # Faster wallets (low median_lag) lose edge faster because the market catches up
-        decay_rate = 0.002 if median_lag < 500 else 0.001
-        remaining = math.exp(-decay_rate * ms) * avg_edge
-        normalized = remaining / max(avg_edge, 0.01)
-        curve[label] = max(-0.2, min(1.0, normalized))
+        latency_survival = math.exp(-decay_rate * ms)
+        curve[label] = max(0.0, min(1.0,
+            edge_factor * EDGE_WEIGHT + latency_survival * LATENCY_WEIGHT))
 
     return curve
 
