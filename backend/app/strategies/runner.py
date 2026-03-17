@@ -149,6 +149,9 @@ class StrategyRunner:
         position_counts_preloaded: dict = {}
         for p in open_positions_cache:
             position_counts_preloaded[p.market_id] = position_counts_preloaded.get(p.market_id, 0) + 1
+        # Track markets that opened a position this cycle to prevent
+        # cross-strategy duplicates (direct_copy+high_conviction on same market)
+        cycle_opened_markets: set = set()
 
         # Single batch query for all new trades
         from app.intelligence.wallet_tracker import detect_new_trades_batch
@@ -211,6 +214,8 @@ class StrategyRunner:
                     strat_bankroll = strategy_bankrolls.get(strat_name, total_bankroll)
                     if strat_bankroll <= 0 and strat_name != "shadow":
                         continue
+                    if strat_name != "shadow" and tx.market_id in cycle_opened_markets:
+                        continue
 
                     tx_side = getattr(tx, "side", None) or "BUY"
                     try:
@@ -272,6 +277,9 @@ class StrategyRunner:
                         if position:
                             stats["trades_executed"] += 1
                             stats["strategy_funnel"][strat_name]["trades_executed"] += 1
+                            global_pos_count += 1
+                            position_counts_preloaded[tx.market_id] = position_counts_preloaded.get(tx.market_id, 0) + 1
+                            cycle_opened_markets.add(tx.market_id)
 
         # 6. Dislocation signals (runs even in shadow mode — records shadow decisions)
         rels = await db.execute(
