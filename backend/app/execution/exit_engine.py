@@ -39,6 +39,8 @@ from app.models.paper import PaperPosition
 from app.models.signal import TradeSignal
 from app.models.trade import WalletTransaction
 
+GAMMA_API = "https://gamma-api.polymarket.com"
+
 logger = logging.getLogger(__name__)
 
 # ── Thresholds ────────────────────────────────────────────────────────────────
@@ -61,6 +63,47 @@ WALLET_REVERSAL_MIN_HOLD_MINUTES = 30
 # Strategy classification
 COPY_STRATEGIES = {"direct_copy", "high_conviction", "leader_copy", "shadow"}
 DISLOCATION_STRATEGIES = {"dislocation"}
+
+
+async def _fetch_resolution_price(market: Market, side: str) -> float | None:
+    """Fetch outcome price from Gamma API for a resolved/closed market.
+
+    Returns the resolution-implied exit price for the given side:
+    - BUY YES at 0.50 → market resolves YES → exit at 1.0
+    - SELL YES at 0.50 → market resolves NO → exit at 0.0
+    """
+    import httpx
+    pid = market.polymarket_id or market.condition_id
+    if not pid:
+        return None
+    try:
+        params = {"id": pid} if market.polymarket_id else {"conditionId": pid}
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{GAMMA_API}/markets", params=params)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            items = data if isinstance(data, list) else [data]
+            if not items:
+                return None
+            m = items[0]
+            prices = []
+            try:
+                prices = [float(p) for p in (m.get("outcomePrices") or "[]").strip("[]").split(",") if p.strip()]
+            except Exception:
+                pass
+            if prices and len(prices) >= 1:
+                yes_price = prices[0]
+                if yes_price > 0.90 or yes_price < 0.10:
+                    return yes_price
+            best_bid = float(m.get("bestBid") or 0)
+            best_ask = float(m.get("bestAsk") or 1)
+            mid = (best_bid + best_ask) / 2 if best_bid and best_ask else float(m.get("lastTradePrice") or 0)
+            if mid > 0.90 or mid < 0.10:
+                return mid
+    except Exception as e:
+        logger.debug(f"Resolution price fetch failed: {e}")
+    return None
 
 
 async def get_latest_snapshot(
@@ -347,8 +390,11 @@ async def run_exit_cycle(db: AsyncSession) -> dict[str, Any]:
 
             # ── Global Rule 1: Market resolved ────────────────────────────────
             # is_active=False means Polymarket has officially resolved the market.
+            # Fetch actual resolution price from API (0 or 1) instead of stale
+            # cached snapshot (which is likely the pre-resolution midpoint ~0.50).
             if market and not market.is_active:
-                exit_price = await get_latest_price(db, pos.market_id) or entry
+                resolution_px = await _fetch_resolution_price(market, pos.side or "BUY")
+                exit_price = resolution_px or await get_latest_price(db, pos.market_id) or entry
                 info = await close_position(db, pos, exit_price, "market_resolved")
                 closed.append(info)
                 already_closed_this_cycle.add(pos.id)
@@ -363,8 +409,15 @@ async def run_exit_cycle(db: AsyncSession) -> dict[str, Any]:
                 end_dt = market.end_date.replace(tzinfo=timezone.utc)
                 if end_dt < now:
                     hours_past_end = (now - end_dt).total_seconds() / 3600
+                    # Try API for resolution price first
+                    resolution_px = await _fetch_resolution_price(market, pos.side or "BUY")
+                    if resolution_px is not None:
+                        info = await close_position(db, pos, resolution_px, "market_resolved")
+                        closed.append(info)
+                        already_closed_this_cycle.add(pos.id)
+                        continue
+                    # Check cached snapshot for extreme price
                     current_px = await get_latest_price(db, pos.market_id)
-                    # Price near extreme = market has effectively resolved
                     if current_px is not None and (current_px < 0.05 or current_px > 0.95):
                         info = await close_position(db, pos, current_px, "market_resolved")
                         closed.append(info)
