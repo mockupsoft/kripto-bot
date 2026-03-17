@@ -346,18 +346,37 @@ async def run_exit_cycle(db: AsyncSession) -> dict[str, Any]:
             strategy = pos.strategy or "direct_copy"
 
             # ── Global Rule 1: Market resolved ────────────────────────────────
-            # Check both is_active flag AND end_date — Polymarket can be slow to
-            # mark markets as closed/archived, but end_date is always reliable.
-            market_ended = (
-                (market and not market.is_active)
-                or (market and market.end_date and market.end_date.replace(tzinfo=timezone.utc) < now)
-            )
-            if market_ended:
+            # is_active=False means Polymarket has officially resolved the market.
+            if market and not market.is_active:
                 exit_price = await get_latest_price(db, pos.market_id) or entry
                 info = await close_position(db, pos, exit_price, "market_resolved")
                 closed.append(info)
                 already_closed_this_cycle.add(pos.id)
                 continue
+
+            # ── Global Rule 1b: end_date grace period ────────────────────────
+            # Prediction markets don't resolve instantly after end_date —
+            # resolution can take minutes to hours. Closing at midpoint
+            # guarantees a fee loss. Wait for actual resolution (is_active=False
+            # or price near 0/1), or force-close after a grace period.
+            if market and market.end_date:
+                end_dt = market.end_date.replace(tzinfo=timezone.utc)
+                if end_dt < now:
+                    hours_past_end = (now - end_dt).total_seconds() / 3600
+                    current_px = await get_latest_price(db, pos.market_id)
+                    # Price near extreme = market has effectively resolved
+                    if current_px is not None and (current_px < 0.05 or current_px > 0.95):
+                        info = await close_position(db, pos, current_px, "market_resolved")
+                        closed.append(info)
+                        already_closed_this_cycle.add(pos.id)
+                        continue
+                    # Grace period: force-close 3 hours after end_date
+                    if hours_past_end > 3.0:
+                        exit_price = current_px or entry
+                        info = await close_position(db, pos, exit_price, "market_resolved")
+                        closed.append(info)
+                        already_closed_this_cycle.add(pos.id)
+                        continue
 
             # ── Global Rule 2: Time limit (last resort) ───────────────────────
             age_hours = (now - pos.opened_at.replace(tzinfo=timezone.utc)).total_seconds() / 3600
