@@ -1,0 +1,35 @@
+services:
+  postgres:
+    mem_limit: 0
+    cpus: 0
+    deploy:
+      resources:
+        limits:
+          memory: "0"
+          cpus: "0"
+        reservations:
+          memory: "0"
+  redis:
+    deploy:
+      resources:
+        limits:
+          memory: "0"
+          cpus: "0"
+        reservations:
+          memory: "0"
+  backend:
+    deploy:
+      resources:
+        limits:
+          memory: "0"
+          cpus: "0"
+        reservations:
+          memory: "0"
+  frontend:
+    deploy:
+      resources:
+        limits:
+          memory: "0"
+          cpus: "0"
+        reservations:
+          memory: "0"
