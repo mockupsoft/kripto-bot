@@ -62,6 +62,9 @@ DEFAULT_CONFIGS = {
 # Otomatik kill-switch: PF < 0.8 (son 20 trade) → shadow mode
 # Otomatik restore: PF >= 1.1 → active mode
 
+# STRATEGY_RESEARCH_MODE=true → strategy_manager kill switch devre dışı
+# Araştırma aşamasında veri toplamak için; production'da false yap.
+
 # KRITIK: Rolling stats hesabında NON_TRADING_EXITS filtrelenmeli!
 # stale_data / position_cap_cleanup exitler PF = 0 yapar → strateji yanlışlıkla shadow olur → bankroll = 0 → trades_executed = 0
 NON_TRADING_EXITS = {"stale_data", "position_cap_cleanup", "demo_cleanup"}

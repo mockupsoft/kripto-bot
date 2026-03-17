@@ -28,7 +28,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         while True:
             try:
                 from app.ingestion.live_ingestion import start_live_polling
-                await start_live_polling(market_interval=20, wallet_interval=45)
+                await start_live_polling(market_interval=5, wallet_interval=45)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -42,7 +42,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 backoff = 5  # reset on clean exit
 
     polling_task = asyncio.create_task(_supervised_polling())
-    logger.info("Live Polymarket polling started (markets every 20s, wallets every 45s) — supervised mode")
+    logger.info("Live Polymarket polling started (markets every 5s, wallets every 45s) — supervised mode")
 
     yield
 
@@ -62,10 +62,16 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3002", "http://127.0.0.1:3002"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:3002",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:3002",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 app.include_router(api_router, prefix="/api")

@@ -5,9 +5,11 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.dependencies import get_db
 from app.models.portfolio import PortfolioSnapshot
-from app.models.paper import PaperPosition
+from app.models.paper import PaperOrder, PaperPosition
+from app.models.signal import SignalDecision, TradeSignal
 
 router = APIRouter()
 
@@ -152,6 +154,7 @@ async def get_exit_breakdown(db: AsyncSession = Depends(get_db)) -> dict:
     }
 
 
+@router.get("/per-wallet")
 async def get_per_wallet(db: AsyncSession = Depends(get_db)) -> dict:
     result = await db.execute(
         select(PaperPosition).where(PaperPosition.status == "closed")
@@ -611,6 +614,738 @@ async def get_daily_digest(db: AsyncSession = Depends(get_db)) -> dict:
             "win_rate": all_stats["win_rate"],
             "precision_24h": round(len([p for p in pos_24h if (p.realized_pnl or 0) > 0]) / len(pos_24h), 4) if pos_24h else None,
         },
+    }
+
+
+# Trading vs infra exit classification for validation
+TRADING_EXITS = {"target_hit", "stop_loss", "wallet_reversal", "market_resolved", "max_hold_time", "ev_compression", "spread_normalized"}
+INFRA_EXITS = {"stale_data", "position_cap_cleanup", "demo_cleanup"}
+
+
+def _resolve_validation_cutoff(cutoff_hours: int) -> tuple[datetime, bool]:
+    """Resolve validation cutoff from env or fallback window."""
+    import os
+
+    now = datetime.now(timezone.utc)
+    cutoff_str = os.getenv("VALIDATION_CUTOFF_AT")
+    if cutoff_str:
+        try:
+            cutoff = datetime.fromisoformat(cutoff_str.replace("Z", "+00:00"))
+            return cutoff, True
+        except Exception:
+            pass
+    return now - timedelta(hours=cutoff_hours), False
+
+
+def _safe_pf(values: list[float]) -> float | None:
+    wins = [v for v in values if v > 0]
+    losses = [v for v in values if v <= 0]
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    if gross_loss > 0:
+        return gross_profit / gross_loss
+    if gross_profit > 0:
+        return float("inf")
+    return None
+
+
+async def _build_strategy_conversion_funnel(
+    db: AsyncSession,
+    since: datetime,
+) -> dict:
+    """
+    Build strategy conversion funnel:
+      signals_generated -> signals_passed_filter -> trades_executed -> close_count
+    """
+    sig_result = await db.execute(
+        select(TradeSignal).where(TradeSignal.created_at >= since)
+    )
+    signals = sig_result.scalars().all()
+
+    # Strategy map by signal id
+    strategy_of_signal: dict = {}
+    funnel: dict[str, dict] = {}
+    for s in signals:
+        sid = s.id
+        strat = s.strategy or "unknown"
+        strategy_of_signal[sid] = strat
+        if strat not in funnel:
+            funnel[strat] = {
+                "signals_generated": 0,
+                "decisions_made": 0,
+                "signals_passed_filter": 0,
+                "trades_executed": 0,
+                "close_count": 0,
+                "avg_pnl_per_trade": None,
+                "pf": None,
+                "conversion_signal_to_accept": None,
+                "conversion_accept_to_trade": None,
+                "conversion_trade_to_close": None,
+            }
+        funnel[strat]["signals_generated"] += 1
+
+    dec_result = await db.execute(
+        select(SignalDecision).where(SignalDecision.decided_at >= since)
+    )
+    decisions = dec_result.scalars().all()
+    for d in decisions:
+        strat = strategy_of_signal.get(d.signal_id)
+        if not strat:
+            continue
+        funnel[strat]["decisions_made"] += 1
+        if (d.decision or "").lower() == "accept":
+            funnel[strat]["signals_passed_filter"] += 1
+
+    ord_result = await db.execute(
+        select(PaperOrder.signal_id, TradeSignal.strategy)
+        .join(TradeSignal, TradeSignal.id == PaperOrder.signal_id)
+        .where(
+            PaperOrder.created_at >= since,
+            PaperOrder.signal_id.isnot(None),
+        )
+    )
+    executed_seen: set[tuple[str, str]] = set()
+    for signal_id, strat in ord_result.all():
+        key = (str(signal_id), strat or "unknown")
+        # one trade per signal per strategy in funnel math
+        if key in executed_seen:
+            continue
+        executed_seen.add(key)
+        strategy = strat or "unknown"
+        if strategy not in funnel:
+            funnel[strategy] = {
+                "signals_generated": 0,
+                "decisions_made": 0,
+                "signals_passed_filter": 0,
+                "trades_executed": 0,
+                "close_count": 0,
+                "avg_pnl_per_trade": None,
+                "pf": None,
+                "conversion_signal_to_accept": None,
+                "conversion_accept_to_trade": None,
+                "conversion_trade_to_close": None,
+            }
+        funnel[strategy]["trades_executed"] += 1
+
+    pos_result = await db.execute(
+        select(PaperPosition).where(
+            PaperPosition.status == "closed",
+            PaperPosition.closed_at >= since,
+        )
+    )
+    closed_positions = pos_result.scalars().all()
+    pnl_by_strategy: dict[str, list[float]] = {}
+    for p in closed_positions:
+        strat = p.strategy or "unknown"
+        if strat not in funnel:
+            funnel[strat] = {
+                "signals_generated": 0,
+                "decisions_made": 0,
+                "signals_passed_filter": 0,
+                "trades_executed": 0,
+                "close_count": 0,
+                "avg_pnl_per_trade": None,
+                "pf": None,
+                "conversion_signal_to_accept": None,
+                "conversion_accept_to_trade": None,
+                "conversion_trade_to_close": None,
+            }
+        funnel[strat]["close_count"] += 1
+        pnl_by_strategy.setdefault(strat, []).append(float(p.realized_pnl or 0))
+
+    for strat, row in funnel.items():
+        pnl_values = pnl_by_strategy.get(strat, [])
+        if pnl_values:
+            row["avg_pnl_per_trade"] = round(sum(pnl_values) / len(pnl_values), 4)
+            pf = _safe_pf(pnl_values)
+            row["pf"] = round(pf, 4) if pf not in (None, float("inf")) else None
+        sg = row["signals_generated"]
+        sa = row["signals_passed_filter"]
+        te = row["trades_executed"]
+        cc = row["close_count"]
+        row["conversion_signal_to_accept"] = round(sa / sg, 4) if sg else None
+        row["conversion_accept_to_trade"] = round(te / sa, 4) if sa else None
+        row["conversion_trade_to_close"] = round(cc / te, 4) if te else None
+
+    by_strategy = [
+        {"strategy": strat, **vals}
+        for strat, vals in sorted(funnel.items(), key=lambda x: x[0])
+    ]
+    totals = {
+        "signals_generated": sum(r["signals_generated"] for r in by_strategy),
+        "decisions_made": sum(r["decisions_made"] for r in by_strategy),
+        "signals_passed_filter": sum(r["signals_passed_filter"] for r in by_strategy),
+        "trades_executed": sum(r["trades_executed"] for r in by_strategy),
+        "close_count": sum(r["close_count"] for r in by_strategy),
+    }
+    totals["conversion_signal_to_accept"] = (
+        round(totals["signals_passed_filter"] / totals["signals_generated"], 4)
+        if totals["signals_generated"] else None
+    )
+    totals["conversion_accept_to_trade"] = (
+        round(totals["trades_executed"] / totals["signals_passed_filter"], 4)
+        if totals["signals_passed_filter"] else None
+    )
+    totals["conversion_trade_to_close"] = (
+        round(totals["close_count"] / totals["trades_executed"], 4)
+        if totals["trades_executed"] else None
+    )
+    return {"since": since.isoformat(), "totals": totals, "by_strategy": by_strategy}
+
+
+@router.get("/validation-cutoff-suggestion")
+async def get_validation_cutoff_suggestion() -> dict:
+    """
+    Call right after backend restart + healthcheck to get exact cutoff for .env.
+    Set VALIDATION_CUTOFF_AT to the returned value.
+    """
+    now = datetime.now(timezone.utc)
+    return {
+        "suggested_cutoff": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "instruction": "Add to .env: VALIDATION_CUTOFF_AT=" + now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+@router.get("/validation-report")
+async def get_validation_report(
+    cutoff_hours: int = Query(48, ge=1, le=168, description="Hours since cutoff for 'after' window (default 48h post-patch)"),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    Post-patch validation: trading vs infra exits, before/after comparison.
+
+    Use VALIDATION_CUTOFF_AT env (ISO datetime) to split before/after.
+    If not set, uses last N hours as 'after' and previous N hours as 'before'.
+
+    Key metrics:
+    - trading_exits: real signal-quality exits (target_hit, stop_loss, etc.)
+    - infra_exits: stale_data, position_cap_cleanup, demo_cleanup
+    - stale_data share: should drop post-patch
+    - PF on trading_exits only: target > 1.0
+    """
+    now = datetime.now(timezone.utc)
+    cutoff, from_env = _resolve_validation_cutoff(cutoff_hours)
+
+    before_start = cutoff - timedelta(hours=cutoff_hours)
+    before_end = cutoff
+    after_start = cutoff
+    after_end = now
+
+    result = await db.execute(
+        select(PaperPosition).where(
+            PaperPosition.status == "closed",
+            PaperPosition.closed_at.isnot(None),
+        )
+    )
+    all_pos = result.scalars().all()
+
+    def _classify(reason: str | None) -> str:
+        r = reason or "unknown"
+        if r in TRADING_EXITS:
+            return "trading"
+        if r in INFRA_EXITS:
+            return "infra"
+        return "other"
+
+    def _stats(pos_list: list) -> dict:
+        if not pos_list:
+            return {"count": 0, "gross_pnl": 0, "net_pnl": 0, "fees": 0, "slippage": 0,
+                    "target_hit": 0, "stop_loss": 0, "stale_data": 0, "pf": None, "win_rate": None,
+                    "avg_pnl_per_trade": None}
+        wins = [p for p in pos_list if (p.realized_pnl or 0) > 0]
+        losses = [p for p in pos_list if (p.realized_pnl or 0) <= 0]
+        gross = sum(float(p.realized_pnl or 0) for p in pos_list)
+        fees = sum(float(p.total_fees or 0) for p in pos_list)
+        slip = sum(float(p.total_slippage or 0) for p in pos_list)
+        tw = sum(float(p.realized_pnl or 0) for p in wins)
+        tl = abs(sum(float(p.realized_pnl or 0) for p in losses))
+        pf = tw / tl if tl > 0 else (None if tw == 0 else float("inf"))
+        return {
+            "count": len(pos_list),
+            "gross_pnl": round(gross, 4),
+            "net_pnl": round(gross - fees - slip, 4),
+            "fees": round(fees, 4),
+            "slippage": round(slip, 4),
+            "target_hit": sum(1 for p in pos_list if p.exit_reason == "target_hit"),
+            "stop_loss": sum(1 for p in pos_list if p.exit_reason == "stop_loss"),
+            "stale_data": sum(1 for p in pos_list if p.exit_reason == "stale_data"),
+            "position_cap_cleanup": sum(1 for p in pos_list if p.exit_reason == "position_cap_cleanup"),
+            "pf": round(pf, 4) if pf and pf != float("inf") else None,
+            "win_rate": round(len(wins) / len(pos_list), 4) if pos_list else None,
+            "avg_pnl_per_trade": round(gross / len(pos_list), 4) if pos_list else None,
+        }
+
+    def _avg_hold_hours(pos_list: list) -> float | None:
+        if not pos_list:
+            return None
+        hours = []
+        for p in pos_list:
+            if p.opened_at and p.closed_at:
+                h = (p.closed_at.replace(tzinfo=timezone.utc) - p.opened_at.replace(tzinfo=timezone.utc)).total_seconds() / 3600
+                hours.append(h)
+        return round(sum(hours) / len(hours), 2) if hours else None
+
+    pos_before = [p for p in all_pos if p.closed_at and before_start <= p.closed_at < before_end]
+    pos_after = [p for p in all_pos if p.closed_at and after_start <= p.closed_at <= after_end]
+
+    # Avg spread at entry (from signal_decisions via paper_orders)
+    from sqlalchemy import text
+    async def _avg_spread_for_range(start, end, inclusive_end: bool = False) -> float | None:
+        cond = "pp.closed_at <= :end" if inclusive_end else "pp.closed_at < :end"
+        r = await db.execute(text(f"""
+            SELECT AVG(sd.spread_at_decision) AS avg_spread
+            FROM paper_positions pp
+            JOIN paper_orders po ON po.market_id = pp.market_id
+              AND po.created_at BETWEEN pp.opened_at - INTERVAL '5 seconds'
+                                    AND pp.opened_at + INTERVAL '5 seconds'
+            JOIN signal_decisions sd ON sd.signal_id = po.signal_id AND sd.decision = 'accept'
+            WHERE pp.status = 'closed' AND pp.closed_at >= :start AND {cond}
+              AND sd.spread_at_decision IS NOT NULL
+        """), {"start": start, "end": end})
+        row = r.mappings().one_or_none()
+        return round(float(row["avg_spread"]), 4) if row and row["avg_spread"] is not None else None
+
+    avg_spread_before = await _avg_spread_for_range(before_start, before_end)
+    avg_spread_after = await _avg_spread_for_range(after_start, after_end, inclusive_end=True)
+
+    trading_before = [p for p in pos_before if _classify(p.exit_reason) == "trading"]
+    trading_after = [p for p in pos_after if _classify(p.exit_reason) == "trading"]
+    infra_before = [p for p in pos_before if _classify(p.exit_reason) == "infra"]
+    infra_after = [p for p in pos_after if _classify(p.exit_reason) == "infra"]
+
+    def _build_alarm_checks(pb, pa, ta, st, asp_before, asp_after):
+        sb, sa = st(pb), st(pa)
+        ta_st = st(ta) if ta else {}
+        real_share_before = len([p for p in pb if _classify(p.exit_reason) == "trading"]) / len(pb) if pb else 0
+        real_share_after = len([p for p in pa if _classify(p.exit_reason) == "trading"]) / len(pa) if pa else 0
+        fee_slip_before = (sb["fees"] + sb["slippage"]) / abs(sb["gross_pnl"]) if pb and sb["gross_pnl"] != 0 else None
+        fee_slip_after = (sa["fees"] + sa["slippage"]) / abs(sa["gross_pnl"]) if pa and sa["gross_pnl"] != 0 else None
+        return {
+            "stale_data_share_dropped": (sa["stale_data"] / len(pa) < sb["stale_data"] / len(pb))
+            if pb and pa else None,
+            "trading_pf_above_1": (ta_st.get("pf") or 0) >= 1.0 if ta else None,
+            "target_hit_gt_stop_loss": ta_st.get("target_hit", 0) > ta_st.get("stop_loss", 0) if ta else None,
+            "avg_entry_spread_below_0_03": (asp_after is not None and asp_after < 0.03) if asp_after is not None else None,
+            "fee_plus_slippage_share_improved": (
+                fee_slip_after is not None and fee_slip_before is not None and fee_slip_after < fee_slip_before
+            ),
+            "real_trade_share_improved": real_share_after > real_share_before if pb and pa else None,
+        }
+
+    # Hold time buckets (for after only)
+    hold_buckets = {"0_2h": [], "2_6h": [], "6_24h": [], "24h_plus": []}
+    for p in pos_after:
+        if p.opened_at and p.closed_at:
+            h = (p.closed_at.replace(tzinfo=timezone.utc) - p.opened_at.replace(tzinfo=timezone.utc)).total_seconds() / 3600
+            if h < 2:
+                hold_buckets["0_2h"].append(p)
+            elif h < 6:
+                hold_buckets["2_6h"].append(p)
+            elif h < 24:
+                hold_buckets["6_24h"].append(p)
+            else:
+                hold_buckets["24h_plus"].append(p)
+
+    sb, sa = _stats(pos_before), _stats(pos_after)
+
+    return {
+        "generated_at": now.isoformat(),
+        "cutoff": cutoff.isoformat(),
+        "cutoff_source": "env" if from_env else f"fallback_last_{cutoff_hours}h",
+        "windows": {
+            "before": {"start": before_start.isoformat(), "end": before_end.isoformat()},
+            "after": {"start": after_start.isoformat(), "end": after_end.isoformat()},
+        },
+        "summary": {
+            "total_closed_before": len(pos_before),
+            "total_closed_after": len(pos_after),
+            "trading_closed_before": len(trading_before),
+            "trading_closed_after": len(trading_after),
+            "infra_closed_before": len(infra_before),
+            "infra_closed_after": len(infra_after),
+            "fee_before": sb["fees"],
+            "fee_after": sa["fees"],
+            "slippage_before": sb["slippage"],
+            "slippage_after": sa["slippage"],
+            "avg_spread_entry_before": avg_spread_before,
+            "avg_spread_entry_after": avg_spread_after,
+            "avg_hold_hours_before": _avg_hold_hours(pos_before),
+            "avg_hold_hours_after": _avg_hold_hours(pos_after),
+        },
+        "before_patch": {
+            "total": sb,
+            "trading_only": _stats(trading_before),
+            "infra_only": _stats(infra_before),
+            "stale_data_share": round(len(infra_before) / len(pos_before), 4) if pos_before else None,
+        },
+        "after_patch": {
+            "total": sa,
+            "trading_only": _stats(trading_after),
+            "infra_only": _stats(infra_after),
+            "stale_data_share": round(len([p for p in pos_after if p.exit_reason == "stale_data"]) / len(pos_after), 4) if pos_after else None,
+        },
+        "hold_time_buckets_after": {
+            k: _stats(v) for k, v in hold_buckets.items()
+        },
+        "alarm_checks": _build_alarm_checks(pos_before, pos_after, trading_after, _stats, avg_spread_before, avg_spread_after),
+        "exit_classification": {
+            "trading": list(TRADING_EXITS),
+            "infra": list(INFRA_EXITS),
+        },
+    }
+
+
+@router.get("/strategy-conversion-funnel")
+async def get_strategy_conversion_funnel(
+    lookback_hours: int = Query(48, ge=1, le=168),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Signals -> accepts -> executed trades -> closed trades conversion funnel."""
+    since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    funnel = await _build_strategy_conversion_funnel(db, since=since)
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "lookback_hours": lookback_hours,
+        **funnel,
+    }
+
+
+@router.get("/baseline-snapshot")
+async def get_baseline_snapshot(
+    cutoff_hours: int = Query(48, ge=1, le=168),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    Single-shot baseline pack for 6-hour monitoring loop.
+    Includes 3 vitals + alarm checks + conversion funnel.
+    """
+    validation = await get_validation_report(cutoff_hours=cutoff_hours, db=db)
+    stale = await get_stale_data_analytics(db=db)
+    strategy_health = await get_strategy_health(db=db)
+    since = datetime.now(timezone.utc) - timedelta(hours=cutoff_hours)
+    funnel = await _build_strategy_conversion_funnel(db, since=since)
+
+    after_trading = (validation.get("after_patch", {}) or {}).get("trading_only", {}) or {}
+    after_total = (validation.get("after_patch", {}) or {}).get("total", {}) or {}
+    before_stale_share = (validation.get("before_patch", {}) or {}).get("stale_data_share")
+    after_stale_share = (validation.get("after_patch", {}) or {}).get("stale_data_share")
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "cutoff": validation.get("cutoff"),
+        "cutoff_source": validation.get("cutoff_source"),
+        "vitals": {
+            "trading_only_pf": after_trading.get("pf"),
+            "expectancy_proxy_avg_pnl_per_trade": after_trading.get("avg_pnl_per_trade"),
+            "stale_data_share": after_stale_share,
+            "stale_share_delta_vs_before": (
+                round(after_stale_share - before_stale_share, 4)
+                if isinstance(before_stale_share, (int, float)) and isinstance(after_stale_share, (int, float))
+                else None
+            ),
+        },
+        "alarm_checks": validation.get("alarm_checks", {}),
+        "trading_after": after_trading,
+        "total_after": after_total,
+        "strategy_conversion_funnel": funnel,
+        "strategy_health_summary": strategy_health.get("summary", {}),
+        "stale_data_analytics": {
+            "total_stale_exits": stale.get("total_stale_exits"),
+            "total_pnl_impact": stale.get("total_pnl_impact"),
+            "top_markets_by_stale_count": stale.get("top_markets_by_stale_count", [])[:10],
+        },
+    }
+
+
+@router.get("/stale-phase-status")
+async def get_stale_phase_status(
+    phase: str = Query("A", pattern="^[ABCabc]$"),
+    cutoff_hours: int = Query(48, ge=1, le=168),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    Phase compliance check for stale guard rollout:
+    A=soft_guard only, B=stale_exit_disabled test, C=blacklist local surgery.
+    """
+    settings = get_settings()
+    phase_u = phase.upper()
+    expected = {
+        "A": {"STALE_SOFT_GUARD": True, "STALE_EXIT_DISABLED": False, "blacklist_required": False},
+        "B": {"STALE_SOFT_GUARD": True, "STALE_EXIT_DISABLED": True, "blacklist_required": False},
+        "C": {"STALE_SOFT_GUARD": True, "STALE_EXIT_DISABLED": False, "blacklist_required": True},
+    }[phase_u]
+
+    blacklist_count = len([s for s in (settings.STALE_MARKET_BLACKLIST or "").split(",") if s.strip()])
+    checks = {
+        "soft_guard_ok": settings.STALE_SOFT_GUARD == expected["STALE_SOFT_GUARD"],
+        "stale_exit_disabled_ok": settings.STALE_EXIT_DISABLED == expected["STALE_EXIT_DISABLED"],
+        "blacklist_ok": (blacklist_count > 0) if expected["blacklist_required"] else (blacklist_count == 0),
+    }
+    validation = await get_validation_report(cutoff_hours=cutoff_hours, db=db)
+    open_count = await db.scalar(select(func.count()).where(PaperPosition.status == "open")) or 0
+    compliant = all(checks.values())
+
+    return {
+        "phase": phase_u,
+        "compliant": compliant,
+        "checks": checks,
+        "current_config": {
+            "STALE_SOFT_GUARD": settings.STALE_SOFT_GUARD,
+            "STALE_EXIT_DISABLED": settings.STALE_EXIT_DISABLED,
+            "STALE_MARKET_BLACKLIST_count": blacklist_count,
+            "STALE_SNAPSHOT_HOURS": settings.STALE_SNAPSHOT_HOURS,
+        },
+        "health_signals": {
+            "stale_data_share_after": ((validation.get("after_patch") or {}).get("stale_data_share")),
+            "infra_closed_after": ((validation.get("summary") or {}).get("infra_closed_after")),
+            "open_positions": open_count,
+        },
+    }
+
+
+@router.get("/entry-single-knob")
+async def get_entry_single_knob(
+    lookback_hours: int = Query(72, ge=1, le=240),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    import os
+
+    """
+    Suggest exactly one entry knob based on dominant reject reason Pareto.
+    """
+    since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    result = await db.execute(
+        select(SignalDecision, TradeSignal.strategy)
+        .join(TradeSignal, TradeSignal.id == SignalDecision.signal_id)
+        .where(
+            SignalDecision.decided_at >= since,
+            SignalDecision.decision == "reject",
+            SignalDecision.reject_reason.isnot(None),
+        )
+    )
+    rows = result.all()
+
+    reason_counts: dict[str, int] = {}
+    for dec, _strategy in rows:
+        reason = str(dec.reject_reason or "unknown")
+        key = reason.split(":")[0]
+        reason_counts[key] = reason_counts.get(key, 0) + 1
+
+    pareto = sorted(
+        [{"reject_reason": k, "count": v} for k, v in reason_counts.items()],
+        key=lambda x: -x["count"],
+    )
+    total_rejects = sum(r["count"] for r in pareto)
+    dominant = pareto[0]["reject_reason"] if pareto else None
+
+    # Single-knob mapping
+    param = None
+    direction = None
+    rationale = "Insufficient reject data."
+    if dominant:
+        d = dominant.lower()
+        if "spread" in d:
+            param = "MAX_SPREAD_ABS"
+            direction = "increase_slightly"
+            rationale = "Dominant blocker spread-related; widen spread gate slightly as single-knob test."
+        elif "conf_edge" in d or "edge" in d:
+            param = "MIN_CONF_EDGE"
+            direction = "decrease_slightly"
+            rationale = "Dominant blocker confidence-edge related; lower min confidence edge slightly as single-knob test."
+        elif "liquidity" in d:
+            param = "MIN_DEPTH_USD"
+            direction = "decrease_slightly"
+            rationale = "Dominant blocker liquidity; lower minimum depth slightly as single-knob test."
+        else:
+            param = "MAX_SPREAD_ABS"
+            direction = "no_change"
+            rationale = "No clear mapping; keep knobs unchanged until more rejects accumulate."
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "lookback_hours": lookback_hours,
+        "total_rejects": total_rejects,
+        "reject_pareto": pareto[:10],
+        "dominant_reject_reason": dominant,
+        "current_entry_knobs": {
+            "MIN_CONF_EDGE": float(os.getenv("MIN_CONF_EDGE", "0.012")),
+            "MAX_SPREAD_ABS": float(os.getenv("MAX_SPREAD_ABS", "0.03")),
+        },
+        "single_knob_policy": {
+            "parameter": param,
+            "direction": direction,
+            "rationale": rationale,
+            "rule": "Change only one parameter per iteration.",
+            "violation_detected": (
+                float(os.getenv("MIN_CONF_EDGE", "0.012")) != 0.012
+                and float(os.getenv("MAX_SPREAD_ABS", "0.03")) != 0.03
+            ),
+        },
+    }
+
+
+@router.get("/decision-gate-72h")
+async def get_decision_gate_72h(
+    cutoff_hours: int = Query(72, ge=24, le=240),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    Keep / Iterate / Rollback decision endpoint for the first 72h gate.
+    """
+    validation = await get_validation_report(cutoff_hours=cutoff_hours, db=db)
+    settings = get_settings()
+    after_patch = validation.get("after_patch", {}) or {}
+    before_patch = validation.get("before_patch", {}) or {}
+    trading_after = after_patch.get("trading_only", {}) or {}
+    stale_before = before_patch.get("stale_data_share")
+    stale_after = after_patch.get("stale_data_share")
+    alarm_checks = validation.get("alarm_checks", {}) or {}
+
+    pf = trading_after.get("pf")
+    expectancy = trading_after.get("avg_pnl_per_trade")
+    open_positions = await db.scalar(select(func.count()).where(PaperPosition.status == "open")) or 0
+    stale_dropped = (
+        isinstance(stale_before, (int, float))
+        and isinstance(stale_after, (int, float))
+        and stale_after < stale_before
+    )
+
+    keep_conditions = {
+        "pf_ge_1": (pf is not None and pf >= 1.0),
+        "expectancy_positive": (expectancy is not None and expectancy > 0),
+        "stale_share_dropped": stale_dropped,
+        "stop_loss_stabilized_0_10": abs(float(settings.STOP_LOSS_PCT) - 0.10) < 1e-9,
+        "open_positions_controlled": open_positions <= 50,
+        "alarms_majority_green": sum(1 for v in alarm_checks.values() if v is True) >= 4,
+    }
+    keep = all(keep_conditions.values())
+
+    rollback_conditions = {
+        "stale_not_improved": (not stale_dropped),
+        "expectancy_negative": (expectancy is not None and expectancy < 0),
+        "open_positions_risky": open_positions > 100,
+    }
+    rollback = sum(1 for v in rollback_conditions.values() if v) >= 2
+
+    if keep:
+        verdict = "keep_and_scale"
+    elif rollback:
+        verdict = "rollback"
+    else:
+        verdict = "iterate_filters"
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "window_hours": cutoff_hours,
+        "verdict": verdict,
+        "keep_conditions": keep_conditions,
+        "rollback_conditions": rollback_conditions,
+        "key_metrics": {
+            "trading_only_pf": pf,
+            "expectancy": expectancy,
+            "stale_data_share_before": stale_before,
+            "stale_data_share_after": stale_after,
+            "stop_loss_pct": float(settings.STOP_LOSS_PCT),
+            "open_positions": open_positions,
+            "alarm_checks": alarm_checks,
+        },
+    }
+
+
+@router.get("/position-cap-cleanup-verification")
+async def get_position_cap_cleanup_verification(
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    Verify position_cap_cleanup: timestamp distribution and post-cutoff count.
+    If count_after_cutoff == 0 → legacy (no new records). If > 0 → hayalet hâlâ evde.
+    """
+    import os
+
+    cutoff_str = os.getenv("VALIDATION_CUTOFF_AT")
+    cutoff = None
+    if cutoff_str:
+        try:
+            cutoff = datetime.fromisoformat(cutoff_str.replace("Z", "+00:00"))
+        except Exception:
+            pass
+
+    result = await db.execute(
+        select(PaperPosition)
+        .where(PaperPosition.exit_reason == "position_cap_cleanup")
+        .order_by(PaperPosition.closed_at.desc())
+    )
+    positions = result.scalars().all()
+
+    # Timestamp distribution: by date
+    by_date: dict[str, int] = {}
+    for p in positions:
+        if p.closed_at:
+            key = p.closed_at.strftime("%Y-%m-%d")
+            by_date[key] = by_date.get(key, 0) + 1
+
+    count_after_cutoff = sum(1 for p in positions if p.closed_at and cutoff and p.closed_at >= cutoff) if cutoff else None
+    latest_closed = positions[0].closed_at.isoformat() if positions else None
+
+    return {
+        "total_position_cap_cleanup": len(positions),
+        "count_after_cutoff": count_after_cutoff,
+        "cutoff": cutoff.isoformat() if cutoff else None,
+        "verdict": (
+            "legacy" if count_after_cutoff == 0 and cutoff
+            else "active" if count_after_cutoff and count_after_cutoff > 0
+            else "unknown"
+        ),
+        "latest_closed_at": latest_closed,
+        "by_date": dict(sorted(by_date.items(), key=lambda x: -x[1])),
+    }
+
+
+@router.get("/stale-data-analytics")
+async def get_stale_data_analytics(
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    Aggregate stale_data exits: market distribution, strategy split.
+    Note: snap_age_h per exit comes from logs; here we show counts and PnL impact.
+    """
+    result = await db.execute(
+        select(PaperPosition)
+        .where(PaperPosition.exit_reason == "stale_data", PaperPosition.status == "closed")
+    )
+    positions = result.scalars().all()
+
+    by_market: dict[str, dict] = {}
+    by_strategy: dict[str, int] = {}
+    total_pnl = 0.0
+
+    for p in positions:
+        mid = str(p.market_id)
+        if mid not in by_market:
+            by_market[mid] = {"count": 0, "total_pnl": 0.0}
+        by_market[mid]["count"] += 1
+        by_market[mid]["total_pnl"] += float(p.realized_pnl or 0)
+
+        strat = p.strategy or "unknown"
+        by_strategy[strat] = by_strategy.get(strat, 0) + 1
+        total_pnl += float(p.realized_pnl or 0)
+
+    # Top markets by stale count (worst offenders)
+    top_markets = sorted(
+        [{"market_id": k, **v} for k, v in by_market.items()],
+        key=lambda x: -x["count"],
+    )[:20]
+
+    # Suggested blacklist: top 10 for copy-paste into STALE_MARKET_BLACKLIST
+    suggested_blacklist = ",".join(t["market_id"] for t in top_markets[:10])
+
+    return {
+        "total_stale_exits": len(positions),
+        "total_pnl_impact": round(total_pnl, 4),
+        "by_strategy": by_strategy,
+        "top_markets_by_stale_count": top_markets,
+        "market_count": len(by_market),
+        "suggested_blacklist": suggested_blacklist,
     }
 
 

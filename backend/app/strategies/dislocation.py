@@ -30,7 +30,7 @@ from app.strategies.base import BaseStrategy
 _Z_THRESHOLD         = float(os.getenv("DISLOCATION_MIN_Z",              "2.0"))
 _MIN_CONF_EDGE       = float(os.getenv("DISLOCATION_MIN_CONF_EDGE",       "0.005"))
 _MIN_DEPTH           = float(os.getenv("DISLOCATION_MIN_DEPTH",           "20.0"))
-_MAX_SPREAD          = float(os.getenv("DISLOCATION_MAX_SPREAD_PCT",      "0.20"))
+_MAX_SPREAD          = float(os.getenv("DISLOCATION_MAX_SPREAD_PCT",      "0.03"))
 _MAX_SIGNAL_AGE_MS   = int(os.getenv("DISLOCATION_MAX_SIGNAL_AGE_MS",     "3000"))
 _MAX_SPREAD_TO_EDGE  = float(os.getenv("DISLOCATION_MAX_SPREAD_TO_EDGE",  "0.8"))
 _MIN_CONF_FACTOR     = float(os.getenv("DISLOCATION_MIN_CONF_FACTOR",     "0.5"))

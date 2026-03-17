@@ -30,6 +30,13 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     LOG_FORMAT: str = "json"
 
+    # Exit engine — execution layer tuning (see 00-known-issues.mdc)
+    STALE_SNAPSHOT_HOURS: float = 4.0     # was 2h — prediction markets need patience; 4–6h for test
+    STALE_SOFT_GUARD: bool = False        # if True: don't force-close on stale, only block new entries
+    STALE_EXIT_DISABLED: bool = False     # 24h test: disable stale_data exits entirely
+    STOP_LOSS_PCT: float = 0.10           # was 0.08 — "edge var ama sabır yok"; 10% gives more room
+    STALE_MARKET_BLACKLIST: str = ""     # comma-separated market UUIDs; from top_markets_by_stale_count
+
 
 class DemoModeViolation(RuntimeError):
     """Raised when any code path attempts real-money operations."""
@@ -46,6 +53,14 @@ def assert_demo_mode(settings: Settings) -> None:
 def compute_config_hash(config: dict) -> str:
     canonical = json.dumps(config, sort_keys=True, default=str)
     return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
+def get_stale_market_blacklist(settings: Settings) -> frozenset[str]:
+    """Parse STALE_MARKET_BLACKLIST into set of market IDs for fast lookup."""
+    raw = (settings.STALE_MARKET_BLACKLIST or "").strip()
+    if not raw:
+        return frozenset()
+    return frozenset(m.strip() for m in raw.split(",") if m.strip())
 
 
 @lru_cache

@@ -7,18 +7,18 @@ WALLET COPY (direct_copy, high_conviction, leader_copy):
   1. market_resolved     — market kapandı / resolved
   2. wallet_reversal     — kopyalanan wallet ters pozisyon aldı veya sattı
   3. ev_compression      — giriş edge'inin %70+ erimesi
-  4. stop_loss           — %8 kayıp
+  4. stop_loss           — % kayıp (STOP_LOSS_PCT, default 10%)
   5. target_hit          — %8 kâr
-  6. stale_data          — 2 saat snapshot yok
-  7. max_hold_time       — son güvenlik ağı (2 saat)
+  6. stale_data          — snapshot yaşı (STALE_SNAPSHOT_HOURS, default 4h)
+  7. max_hold_time       — son güvenlik ağı (24 saat)
 
 DISLOCATION:
   1. market_resolved
   2. spread_normalized   — z-score normale döndü
   3. ev_compression
-  4. stop_loss
+  4. stop_loss (STOP_LOSS_PCT)
   5. target_hit
-  6. stale_data
+  6. stale_data (STALE_SNAPSHOT_HOURS; STALE_SOFT_GUARD/STALE_EXIT_DISABLED)
   7. max_hold_time
 
 DEMO_MODE_ONLY — never places real orders.
@@ -42,10 +42,9 @@ from app.models.trade import WalletTransaction
 logger = logging.getLogger(__name__)
 
 # ── Thresholds ────────────────────────────────────────────────────────────────
-MAX_HOLD_HOURS = 2           # last resort — prediction market edge is early
-STOP_LOSS_PCT = 0.08         # tighter: %8 (was %15 — too wide for binary markets)
+MAX_HOLD_HOURS = 24          # prediction market edge can take hours to realize
 TARGET_PCT = 0.08            # tighter: %8
-STALE_SNAPSHOT_HOURS = 2
+# STOP_LOSS_PCT, STALE_SNAPSHOT_HOURS from config (env)
 
 # EV Compression: close if current edge < entry_edge * this factor
 EV_COMPRESSION_THRESHOLD = 0.30   # 70% eroded → exit
@@ -359,11 +358,23 @@ async def run_exit_cycle(db: AsyncSession) -> dict[str, Any]:
                 # No snapshot at all
                 continue
 
+            settings = get_settings()
+            stale_threshold = float(settings.STALE_SNAPSHOT_HOURS)
             snap_age_h = (now - snap.captured_at.replace(tzinfo=timezone.utc)).total_seconds() / 3600
-            if snap_age_h > STALE_SNAPSHOT_HOURS:
-                info = await close_position(db, pos, entry, "stale_data")
-                closed.append(info)
-                already_closed_this_cycle.add(pos.id)
+            if snap_age_h > stale_threshold:
+                if settings.STALE_EXIT_DISABLED or settings.STALE_SOFT_GUARD:
+                    logger.info(
+                        f"stale_data skipped (soft_guard/disabled): pos={pos.id} snap_age_h={snap_age_h:.2f}h "
+                        f"threshold={stale_threshold}h market={pos.market_id}"
+                    )
+                else:
+                    logger.info(
+                        f"stale_data exit: pos={pos.id} snap_age_h={snap_age_h:.2f} "
+                        f"threshold={stale_threshold}h market={pos.market_id}"
+                    )
+                    info = await close_position(db, pos, entry, "stale_data")
+                    closed.append(info)
+                    already_closed_this_cycle.add(pos.id)
                 continue
 
             current_price = float(snap.midpoint or snap.last_trade_price or entry)
@@ -408,8 +419,9 @@ async def run_exit_cycle(db: AsyncSession) -> dict[str, Any]:
 
             pnl_pct = unrealized / notional
 
-            # Rule D: Stop loss
-            if pnl_pct < -STOP_LOSS_PCT:
+            # Rule D: Stop loss (threshold from config — was 8%, now 10% default)
+            stop_pct = float(get_settings().STOP_LOSS_PCT)
+            if pnl_pct < -stop_pct:
                 info = await close_position(db, pos, current_price, "stop_loss")
                 closed.append(info)
                 already_closed_this_cycle.add(pos.id)

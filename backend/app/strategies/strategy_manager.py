@@ -27,10 +27,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.paper import PaperPosition
 
 # ── Tuneable constants ─────────────────────────────────────────────────────
-_ROLLING_WINDOW     = int(os.getenv("STRATEGY_ROLLING_WINDOW",   "20"))
-_KILL_PF_THRESHOLD  = float(os.getenv("STRATEGY_KILL_PF",        "0.8"))
+_ROLLING_WINDOW       = int(os.getenv("STRATEGY_ROLLING_WINDOW",   "20"))
+_KILL_PF_THRESHOLD    = float(os.getenv("STRATEGY_KILL_PF",        "0.8"))
 _RESTORE_PF_THRESHOLD = float(os.getenv("STRATEGY_RESTORE_PF",   "1.1"))
-_MIN_TRADES_FOR_KILL = int(os.getenv("STRATEGY_MIN_TRADES_KILL", "10"))
+_MIN_TRADES_FOR_KILL  = int(os.getenv("STRATEGY_MIN_TRADES_KILL", "10"))
+# Research mode: kill switch disabled — strategies stay active for data collection
+_RESEARCH_MODE        = os.getenv("STRATEGY_RESEARCH_MODE", "false").lower() in ("1", "true", "yes")
 
 StrategyMode = Literal["active", "shadow", "paused"]
 
@@ -145,10 +147,10 @@ async def get_rolling_stats(
     avg_loss = sum(losses) / len(losses) if losses else 0.0
     expectancy = (wr * avg_win) + (loss_rate * avg_loss)
 
-    # Kill-switch evaluation
+    # Kill-switch evaluation (skipped in research mode for data collection)
     kill_active = False
     kill_reason: str | None = None
-    if (
+    if not _RESEARCH_MODE and (
         trade_count >= cfg.min_trades_for_kill
         and pf is not None
         and pf < cfg.kill_pf_threshold
@@ -159,9 +161,9 @@ async def get_rolling_stats(
             f"(last {trade_count} trades)"
         )
 
-    # Determine effective mode
+    # Determine effective mode (research mode: keep default, ignore kill)
     mode = cfg.default_mode
-    if kill_active:
+    if not _RESEARCH_MODE and kill_active:
         mode = "shadow"
     elif (
         cfg.default_mode == "shadow"

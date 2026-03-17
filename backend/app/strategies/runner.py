@@ -55,12 +55,22 @@ class StrategyRunner:
 
     async def run_cycle(self, db: AsyncSession) -> dict:
         """Execute one full processing cycle."""
+        tracked_strategies = ["direct_copy", "high_conviction", "leader_copy", "dislocation", "shadow"]
         stats = {
             "events_processed": 0,
             "signals_generated": 0,
             "decisions_made": 0,
             "trades_executed": 0,
             "strategy_modes": {},
+            "strategy_funnel": {
+                name: {
+                    "signals_generated": 0,
+                    "decisions_made": 0,
+                    "signals_passed_filter": 0,
+                    "trades_executed": 0,
+                }
+                for name in tracked_strategies
+            },
         }
 
         # 1. Process pending raw events into domain tables
@@ -155,6 +165,7 @@ class StrategyRunner:
                         available_depth_usd=current_depth,   # Layer-3 liquidity input
                     )
                     stats["signals_generated"] += 1
+                    stats["strategy_funnel"][strat_name]["signals_generated"] += 1
 
                     strat   = self.strategies[strat_name]
                     exposure = await check_exposure(db, tx.market_id, 50, strat_bankroll, wallet_id=w.id)
@@ -175,6 +186,9 @@ class StrategyRunner:
                         decision = None
                     if decision:
                         stats["decisions_made"] += 1
+                        stats["strategy_funnel"][strat_name]["decisions_made"] += 1
+                        if decision.decision == "accept":
+                            stats["strategy_funnel"][strat_name]["signals_passed_filter"] += 1
                         position = await strat.execute(
                             db=db, signal=signal, decision=decision,
                             book_levels=snap.book_levels,
@@ -182,6 +196,7 @@ class StrategyRunner:
                         )
                         if position:
                             stats["trades_executed"] += 1
+                            stats["strategy_funnel"][strat_name]["trades_executed"] += 1
 
         # 6. Dislocation signals (runs even in shadow mode — records shadow decisions)
         rels = await db.execute(
@@ -212,6 +227,7 @@ class StrategyRunner:
 
             if signal:
                 stats["signals_generated"] += 1
+                stats["strategy_funnel"]["dislocation"]["signals_generated"] += 1
                 strat    = self.strategies["dislocation"]
                 exposure = await check_exposure(db, signal.market_id, 50, disloc_bankroll)
 
@@ -227,6 +243,9 @@ class StrategyRunner:
                 )
                 if decision:
                     stats["decisions_made"] += 1
+                    stats["strategy_funnel"]["dislocation"]["decisions_made"] += 1
+                    if decision.decision == "accept":
+                        stats["strategy_funnel"]["dislocation"]["signals_passed_filter"] += 1
                     # Only execute if dislocation is active (bankroll > 0)
                     if disloc_bankroll > 0:
                         position = await strat.execute(
@@ -236,6 +255,7 @@ class StrategyRunner:
                         )
                         if position:
                             stats["trades_executed"] += 1
+                            stats["strategy_funnel"]["dislocation"]["trades_executed"] += 1
 
         # 7. Portfolio snapshot
         await compute_portfolio_snapshot(db, starting_balance=900.0)

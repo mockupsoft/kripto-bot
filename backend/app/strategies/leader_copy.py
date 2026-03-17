@@ -67,7 +67,7 @@ class LeaderCopyStrategy(BaseStrategy):
         self.min_influence_score = min_influence_score
         self._filter = SignalFilter(
             min_net_edge=0.01,
-            max_spread=0.18,
+            max_spread=0.03,
             max_signal_age_ms=5000,
             min_liquidity_usd=30.0,
         )

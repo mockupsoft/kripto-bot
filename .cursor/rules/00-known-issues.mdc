@@ -324,3 +324,109 @@ Aksiyon:
   - Edge calibration endpoint: GET /api/analytics/edge-calibration
 ```
 
+## 17. "23:06'dan sonra işlem yok" — Yeni Trade Açılmıyor
+
+```
+Belirti: Trades sayfasında son işlem açılışı çok eski (örn. 30+ dk önce)
+signals_generated: 150–200 ama trades_executed: 0
+
+Teşhis:
+  1. GET /api/analytics/strategy-health
+     → direct_copy, high_conviction "shadow" ve kill_active: true ise
+     → Rolling PF < 0.8 (son 20 trade) nedeniyle kill switch
+
+  2. docker logs kripto-bot-backend-1 2>&1 | Select-String "trades_executed"
+     → trades_executed: 0 sürekli
+
+Çözüm:
+  docker-compose.yml backend environment:
+    - STRATEGY_RESEARCH_MODE=true
+
+  Bu env ile strategy_manager kill switch devre dışı kalır;
+  direct_copy ve high_conviction tekrar active olur, veri toplamaya devam eder.
+
+  Research mode = araştırma aşamasında veri biriktirmek için kill switch'i kapat.
+  Production'a geçerken STRATEGY_RESEARCH_MODE=false yap.
+```
+
+## 18. 48–72 Saat Gözlem Sonrası Karar Checklist
+
+```
+Cutoff set: VALIDATION_CUTOFF_AT (restart sonrası validation-cutoff-suggestion ile al)
+
+48–72 saat sonra çalıştır:
+  Invoke-RestMethod "http://localhost:8002/api/analytics/validation-report?cutoff_hours=48"
+  Invoke-RestMethod "http://localhost:8002/api/analytics/position-cap-cleanup-verification"
+  Invoke-RestMethod "http://localhost:8002/api/analytics/stale-data-analytics"
+
+Başarı kriterleri (alarm_checks):
+  stale_data_share_dropped, trading_pf_above_1, target_hit_gt_stop_loss
+  avg_entry_spread_below_0_03, fee_plus_slippage_share_improved, real_trade_share_improved
+
+Durum 1 (çoğu yeşil): position sizing / wallet optimizasyonu
+Durum 2 (stale düştü, PF < 1): entry logic, wallet seçimi, reversal
+Durum 3 (stale hâlâ yüksek): top_markets_by_stale_count incele
+```
+
+## 19. Edge / Friction Optimizasyonu (Mar 2026)
+
+```
+Sorun: Sistem coin-toss seviyesinde (target_hit ≈ stop_loss) ama fee+slippage kaybı yüzünden zarar.
+
+Uygulanan değişiklikler:
+  1. stale_data azaltma: _refresh_position_market_snapshots() — açık pozisyonlu marketler her cycle'da Gamma API ile tazelenir
+  2. market_interval: 20s → 5s (daha sık refresh)
+  3. MIN_CONF_EDGE: 0.005 → 0.012 (≈ min_z 1.2 — daha az trade, daha yüksek kalite)
+  4. MAX_SPREAD_ABS: 0.08 → 0.03 (spread %3 üstü edge erir)
+  5. max_hold_time: 2h → 24h (prediction market edge saatler sonra kapanabilir)
+  6. signal_filter Gate 1: eksik if (signal_age_ms) düzeltildi
+
+position_cap_cleanup: FIFO → lowest-edge liquidation önerisi kodda yok; exposure_manager sadece reject eder, kapatmaz.
+```
+
+## 20. position_cap_cleanup — Legacy (Doğrulandı)
+
+```
+DB'de 265+ position_cap_cleanup exit var; mevcut kodda hiçbir yer bu reason'ı yazmıyor.
+GET /api/analytics/position-cap-cleanup-verification:
+  count_after_cutoff: 0 → verdict: "legacy"
+  Cutoff sonrası yeni kayıt yok; mevcut kayıtlar geçmişten.
+
+exit_engine.close_position() sadece şunları kullanır:
+  market_resolved, max_hold_time, stale_data, wallet_reversal,
+  spread_normalized, ev_compression, stop_loss, target_hit
+
+Olası kaynaklar:
+  - Kaldırılmış legacy kod
+  - Eski migration/seed
+  - Başka servis (worker vb.)
+  - Manuel DB güncellemesi
+
+Doğrulama: grep "position_cap_cleanup" → sadece NON_TRADING_EXITS tanımlarında geçiyor.
+Yeni position_cap_cleanup oluşmuyor; mevcut kayıtlar geçmişten kalma.
+```
+
+## 21. Execution Layer — stale_data + stop_loss (Mar 2026)
+
+```
+Teşhis: target_hit (+9.37) vs stop_loss (-10.79) dengede → edge var ama exit sistemi öldürüyor.
+stale_data: 1203 exit, -5.07 PnL, %66 kapanış → "data timeout simulator", trading değil.
+
+Uygulanan düzeltmeler (config.py + exit_engine.py):
+  1. STALE_SNAPSHOT_HOURS: 2 → 4 (default) — prediction market için 2h çok agresif
+  2. STALE_SOFT_GUARD: true → stale'da force-close yok, sadece skip (pozisyon açık kalır)
+  3. STALE_EXIT_DISABLED: 24h test için — stale_data exit tamamen kapat
+  4. STOP_LOSS_PCT: 0.08 → 0.10 — "edge var ama sabır yok", stop biraz gevşet
+  5. STALE_MARKET_BLACKLIST: top 10 worst market UUIDs — signal_filter Gate 0'da reject
+
+Kullanım:
+  # 24h test: stale exit kapat
+  STALE_EXIT_DISABLED=true
+
+  # Kalıcı: stale'da kapatma, sadece yeni giriş engelle (soft guard)
+  STALE_SOFT_GUARD=true
+
+  # Blacklist: /api/analytics/stale-data-analytics → suggested_blacklist kopyala
+  STALE_MARKET_BLACKLIST=uuid1,uuid2,uuid3
+```
+

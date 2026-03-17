@@ -78,7 +78,7 @@ async def list_trades(
     # Last position opened at (for "no new trades" diagnostic)
     last_opened_q = select(func.max(PaperPosition.opened_at)).select_from(PaperPosition)
     last_opened = (await db.execute(last_opened_q)).scalar()
-    last_position_opened_at = last_opened.scalar().isoformat() if last_opened.scalar() else None
+    last_position_opened_at = last_opened.isoformat() if last_opened else None
 
     # Fetch page
     q = base.order_by(PaperPosition.opened_at.desc()).limit(limit).offset(offset)

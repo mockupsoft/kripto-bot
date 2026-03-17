@@ -20,13 +20,15 @@ from datetime import datetime, timezone
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings, get_stale_market_blacklist
+from app.models.market import MarketSnapshot
 from app.models.paper import PaperPosition
 from app.models.signal import SignalDecision, TradeSignal
 
 # Cost regime — configurable via env for parameter sweeps
-MIN_CONF_EDGE = float(os.getenv("MIN_CONF_EDGE", "0.005"))   # loosened: Bayesian prior gives ~0.5 prob without spot feed
+MIN_CONF_EDGE = float(os.getenv("MIN_CONF_EDGE", "0.012"))   # 0.012 ≈ min_z 1.2 — fewer trades, higher quality
 MAX_SPREAD_TO_EDGE_RATIO = float(os.getenv("MAX_SPREAD_TO_EDGE", "0.6"))
-MAX_SPREAD_ABS = float(os.getenv("MAX_SPREAD_ABS", "0.08"))
+MAX_SPREAD_ABS = float(os.getenv("MAX_SPREAD_ABS", "0.03"))   # max 3% spread — edge erodes above this
 MIN_DEPTH_USD = float(os.getenv("MIN_DEPTH_USD", "100.0"))
 
 
@@ -95,7 +97,44 @@ class SignalFilter:
         else:
             spread_to_edge = float("inf")
 
+        # ── Gate 0: stale market blacklist (top offenders from stale-data-analytics) ─
+        settings = get_settings()
+        blacklist = get_stale_market_blacklist(settings)
+        if blacklist and str(signal.market_id) in blacklist:
+            return FilterResult(
+                decision="reject",
+                reason="market_blacklisted: high stale_data history",
+                edge_at_decision=round(edge_at_decision, 6),
+                price_drift=round(price_drift, 6),
+                spread_at_decision=round(current_spread, 4),
+            )
+
+        # ── Gate 0b: soft guard blocks NEW entries on stale snapshots ─
+        # Existing positions are handled by exit_engine; this guard only prevents new entries.
+        if settings.STALE_SOFT_GUARD and signal.market_id:
+            snap_q = await db.execute(
+                select(MarketSnapshot)
+                .where(MarketSnapshot.market_id == signal.market_id)
+                .order_by(MarketSnapshot.captured_at.desc())
+                .limit(1)
+            )
+            latest_snap = snap_q.scalar_one_or_none()
+            if latest_snap and latest_snap.captured_at:
+                snap_age_h = (now - latest_snap.captured_at.replace(tzinfo=timezone.utc)).total_seconds() / 3600
+                if snap_age_h > float(settings.STALE_SNAPSHOT_HOURS):
+                    return FilterResult(
+                        decision="reject",
+                        reason=(
+                            f"stale_soft_guard_block_entry: snap_age_h={snap_age_h:.2f} "
+                            f"> threshold={float(settings.STALE_SNAPSHOT_HOURS):.2f}"
+                        ),
+                        edge_at_decision=round(edge_at_decision, 6),
+                        price_drift=round(price_drift, 6),
+                        spread_at_decision=round(current_spread, 4),
+                    )
+
         # ── Gate 1: signal staleness ──────────────────────────────────────────
+        if signal_age_ms > self.max_signal_age_ms:
             return FilterResult(
                 decision="reject",
                 reason=f"signal_stale: {signal_age_ms}ms > {self.max_signal_age_ms}ms",

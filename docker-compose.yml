@@ -39,19 +39,21 @@ services:
     environment:
       - PYTHONDONTWRITEBYTECODE=1
       - PYTHONUNBUFFERED=1
+      # Research mode: kill switch disabled so direct_copy/high_conviction keep trading for data
+      - STRATEGY_RESEARCH_MODE=true
       # Risk / position limits — tunable without rebuild
       - MAX_OPEN_POSITIONS=30
       - MAX_POSITIONS_PER_WALLET=3
       # Cost regime filters — primary gate for cost/gross ratio
-      - MIN_CONF_EDGE=0.005
+      - MIN_CONF_EDGE=0.012
       - MAX_SPREAD_TO_EDGE=0.6
-      - MAX_SPREAD_ABS=0.08
+      - MAX_SPREAD_ABS=0.03
       - MIN_DEPTH_USD=100.0
       # Dislocation strategy thresholds
       - DISLO_MIN_Z=2.0
       - DISLO_MIN_EDGE=0.01
       - DISLO_MIN_DEPTH=50.0
-      - DISLO_MAX_SPREAD=0.15
+      - DISLO_MAX_SPREAD=0.03
     depends_on:
       postgres:
         condition: service_healthy

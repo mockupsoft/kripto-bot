@@ -33,6 +33,23 @@ CLOB_API = "https://clob.polymarket.com"
 REQUEST_DELAY = 0.5  # seconds between requests
 
 
+async def fetch_market_by_condition(condition_id: str) -> dict | None:
+    """Fetch a single market from Gamma API by condition_id (for position refresh)."""
+    if not condition_id:
+        return None
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.get(f"{GAMMA_API}/markets", params={"conditionId": condition_id, "limit": 1})
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            markets = data if isinstance(data, list) else data.get("value", data) or []
+            return markets[0] if markets else None
+        except Exception as e:
+            logger.debug(f"Gamma fetch by condition_id failed: {e}")
+    return None
+
+
 async def fetch_live_markets(limit: int = 50) -> list[dict]:
     """Fetch currently active markets sorted by 24h volume."""
     async with httpx.AsyncClient(timeout=15.0) as client:
@@ -202,6 +219,8 @@ async def ingest_live_markets(limit: int = 200) -> int:
 
     # Also refresh snapshots for all relationship markets (crypto short-term markets)
     await _refresh_relationship_market_snapshots()
+    # Refresh snapshots for markets with open positions (reduces stale_data exits)
+    await _refresh_position_market_snapshots()
     # Recalibrate spread baselines every ~10 market ingestion cycles
     import random as _rnd
     if _rnd.random() < 0.10:
@@ -333,6 +352,69 @@ async def _refresh_relationship_market_snapshots() -> None:
         await db.commit()
         if refreshed > 0:
             logger.info(f"Refreshed snapshots for {refreshed} relationship markets")
+
+
+async def _refresh_position_market_snapshots() -> None:
+    """
+    Refresh snapshots for markets with open positions.
+    Reduces stale_data exits — positions in low-volume markets not in top-200 get fresh data.
+    """
+    from sqlalchemy import select
+    from app.models.paper import PaperPosition
+
+    async with async_session_factory() as db:
+        pos_result = await db.execute(
+            select(PaperPosition.market_id)
+            .where(PaperPosition.status == "open")
+            .distinct()
+        )
+        position_market_ids = [r[0] for r in pos_result.all() if r[0]]
+        if not position_market_ids:
+            return
+
+        mq = await db.execute(select(Market).where(Market.id.in_(position_market_ids)))
+        markets = {m.id: m for m in mq.scalars().all()}
+        refreshed = 0
+        now = datetime.now(timezone.utc)
+
+        for market_id in position_market_ids:
+            market = markets.get(market_id)
+            if not market or not market.condition_id:
+                continue
+            if market.polymarket_id and str(market.polymarket_id).startswith("demo_"):
+                continue
+            try:
+                m = await fetch_market_by_condition(market.condition_id)
+                if not m:
+                    continue
+                best_bid = float(m.get("bestBid") or 0)
+                best_ask = float(m.get("bestAsk") or 1)
+                last_price = float(m.get("lastTradePrice") or 0)
+                midpoint = (best_bid + best_ask) / 2 if best_bid and best_ask else last_price
+                if midpoint <= 0:
+                    continue
+                snap = MarketSnapshot(
+                    market_id=market_id,
+                    captured_at=now,
+                    best_bid=best_bid if best_bid > 0 else None,
+                    best_ask=best_ask if best_ask > 0 else None,
+                    midpoint=midpoint,
+                    spread=round(best_ask - best_bid, 4) if best_bid and best_ask else None,
+                    bid_depth=float(m.get("liquidityNum") or 100) / 2,
+                    ask_depth=float(m.get("liquidityNum") or 100) / 2,
+                    last_trade_price=last_price if last_price > 0 else None,
+                    volume_24h=float(m.get("volume24hr") or 0) or None,
+                    source="polymarket_gamma_position_refresh",
+                )
+                db.add(snap)
+                refreshed += 1
+                await asyncio.sleep(REQUEST_DELAY)
+            except Exception as e:
+                logger.debug(f"Position market refresh failed for {market_id}: {e}")
+
+        if refreshed > 0:
+            await db.commit()
+            logger.info(f"Refreshed {refreshed} position-market snapshots")
 
 
 async def _recalibrate_relationship_baselines() -> None:
@@ -650,8 +732,17 @@ async def run_live_ingestion_cycle() -> dict:
             await db.commit()
             results["signals_generated"] = strategy_stats.get("signals_generated", 0)
             results["trades_executed"] = strategy_stats.get("trades_executed", 0)
-            if strategy_stats.get("trades_executed", 0) > 0:
+            if "kill_switch" in strategy_stats:
+                logger.info(f"Strategy runner: kill_switch={strategy_stats['kill_switch']}")
+            elif strategy_stats.get("trades_executed", 0) > 0:
                 logger.info(f"Strategy runner: {strategy_stats}")
+            elif strategy_stats.get("signals_generated", 0) > 0:
+                funnel = strategy_stats.get("strategy_funnel", {})
+                logger.info(
+                    "Strategy runner: signals=%s trades_executed=0 funnel=%s",
+                    strategy_stats.get("signals_generated"),
+                    funnel,
+                )
     except Exception as e:
         logger.error(f"Strategy runner failed: {e}")
         results["signals_generated"] = 0
