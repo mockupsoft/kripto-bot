@@ -219,7 +219,14 @@ class SignalFilter:
             )
 
         # ── Gate 3: calibrated confidence gate ─────────────────────────────────
-        if calibrated_confidence < MIN_CALIBRATED_CONFIDENCE:
+        # For copy-trade signals (calibration_method="copy_direct"), the model
+        # probability is market_price ± wallet_edge — NOT a Bayesian estimate.
+        # The standard formula abs(prob-0.5)*2*conf measures prediction extremeness
+        # not confidence, and systematically rejects 50/50 markets (the most
+        # interesting for copy-trading). Skip this gate for copy signals; their
+        # quality is already gated by composite_score and MIN_CONF_EDGE.
+        cb_method = cb.get("calibration_method", "")
+        if cb_method != "copy_direct" and calibrated_confidence < MIN_CALIBRATED_CONFIDENCE:
             return FilterResult(
                 decision="reject",
                 reason=_reason(

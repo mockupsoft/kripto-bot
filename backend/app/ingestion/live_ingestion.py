@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -226,6 +226,10 @@ async def ingest_live_markets(limit: int = 200) -> int:
     import random as _rnd
     if _rnd.random() < 0.10:
         await _recalibrate_relationship_baselines()
+    # Prune old snapshots every ~20 cycles to prevent unbounded table growth
+    # (~1,900 rows/min without cleanup → millions/day)
+    if _rnd.random() < 0.05:
+        await _prune_old_snapshots()
     return count
 
 
@@ -462,6 +466,39 @@ async def _recalibrate_relationship_baselines() -> None:
         if updated:
             await db.commit()
             logger.info(f"Recalibrated baselines for {updated} market relationships")
+
+
+async def _prune_old_snapshots(keep_hours: int = 2, keep_per_market: int = 50) -> None:
+    """Delete old snapshots to prevent unbounded table growth.
+
+    Keeps snapshots from the last `keep_hours` unconditionally.
+    For older snapshots, keeps only the latest `keep_per_market` per market.
+    This preserves enough history for baseline calibration (~500 pairs @ 60s window).
+    """
+    from sqlalchemy import text
+
+    async with async_session_factory() as db:
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=keep_hours)
+            result = await db.execute(text("""
+                DELETE FROM market_snapshots
+                WHERE captured_at < :cutoff
+                AND id NOT IN (
+                    SELECT id FROM (
+                        SELECT id, ROW_NUMBER() OVER (
+                            PARTITION BY market_id ORDER BY captured_at DESC
+                        ) as rn
+                        FROM market_snapshots
+                    ) ranked
+                    WHERE rn <= :keep
+                )
+            """), {"cutoff": cutoff, "keep": keep_per_market})
+            deleted = result.rowcount
+            if deleted > 0:
+                await db.commit()
+                logger.info(f"Pruned {deleted} old market snapshots")
+        except Exception as e:
+            logger.warning(f"Snapshot pruning failed: {e}")
 
 
 async def _ensure_market_exists(db, condition_id: str, slug: str = "") -> "Market | None":
