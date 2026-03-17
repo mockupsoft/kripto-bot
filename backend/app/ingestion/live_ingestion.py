@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -479,9 +479,10 @@ async def _prune_old_snapshots(keep_hours: int = 2, keep_per_market: int = 50) -
 
     async with async_session_factory() as db:
         try:
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=keep_hours)
             result = await db.execute(text("""
                 DELETE FROM market_snapshots
-                WHERE captured_at < NOW() - INTERVAL :hours
+                WHERE captured_at < :cutoff
                 AND id NOT IN (
                     SELECT id FROM (
                         SELECT id, ROW_NUMBER() OVER (
@@ -491,7 +492,7 @@ async def _prune_old_snapshots(keep_hours: int = 2, keep_per_market: int = 50) -
                     ) ranked
                     WHERE rn <= :keep
                 )
-            """), {"hours": f"{keep_hours} hours", "keep": keep_per_market})
+            """), {"cutoff": cutoff, "keep": keep_per_market})
             deleted = result.rowcount
             if deleted > 0:
                 await db.commit()
