@@ -421,8 +421,8 @@ export default function AnalyticsPage() {
             </div>
             <div>
               <p className="text-xs text-gray-500">Expectancy %</p>
-              <p className={`mt-1 text-xl font-bold tabular-nums ${metrics.expectancy_pct > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                {metrics.expectancy_pct > 0 ? '+' : ''}{metrics.expectancy_pct.toFixed(3)}%
+              <p className={`mt-1 text-xl font-bold tabular-nums ${(metrics.expectancy_pct ?? 0) > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                {(metrics.expectancy_pct ?? 0) > 0 ? '+' : ''}{(metrics.expectancy_pct ?? 0).toFixed(3)}%
               </p>
               <p className="text-[10px] text-gray-600">of $900 bankroll</p>
             </div>
