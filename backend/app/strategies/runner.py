@@ -205,14 +205,19 @@ class StrategyRunner:
                     continue
 
                 # Skip markets with insufficient remaining time.
-                # MIN_MARKET_DURATION_MINUTES (default 6) prevents entering
-                # ultra-short windows that resolve as coin flips.
                 if market.end_date:
                     from datetime import timezone as _tz
                     _remaining_min = (market.end_date.replace(tzinfo=_tz.utc) - datetime.now(_tz.utc)).total_seconds() / 60
                     _min_dur = int(os.getenv("MIN_MARKET_DURATION_MINUTES", "6"))
                     if _remaining_min < _min_dur:
                         continue
+
+                # Skip crypto "Up or Down" binary windows — wallet copy signals
+                # have no edge on these markets. 80 trades → 2.5% win rate, -$15.90.
+                # Non-crypto markets are break-even/profitable.
+                _q = (market.question or "").lower()
+                if "up or down" in _q:
+                    continue
 
                 current_price  = float(snap.midpoint or snap.best_bid or 0.5)
                 current_spread = float(snap.spread or 0.04)

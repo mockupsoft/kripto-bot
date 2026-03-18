@@ -100,7 +100,7 @@ services:
       # Stale data: block new entries on stale markets, but don't force-close existing positions
       - STALE_SOFT_GUARD=true
       # Smart Exit v1: epoch tagging and market duration filter
-      - TRADE_EPOCH=smart_exit_v1
+      - TRADE_EPOCH=smart_exit_v2
       - MIN_MARKET_DURATION_MINUTES=6
       # Ingestion performance: smaller batches = less peak memory
       - WALLET_INGEST_BATCH_SIZE=3
