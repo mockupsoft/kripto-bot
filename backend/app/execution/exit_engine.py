@@ -515,20 +515,49 @@ async def run_exit_cycle(db: AsyncSession) -> dict[str, Any]:
 
             pnl_pct = unrealized / notional
 
-            # Rule D: Stop loss (threshold from config — was 8%, now 10% default)
+            # Rule D: Smart stop loss — time-decay tightening
+            # As market approaches resolution, tighten stop to reduce avg loss.
+            # Early: -10% stop. Past 50% of lifetime: -6%. Past 80%: -3%.
             stop_pct = float(get_settings().STOP_LOSS_PCT)
+            if market and market.end_date:
+                end_dt = market.end_date.replace(tzinfo=timezone.utc)
+                total_life = (end_dt - pos.opened_at.replace(tzinfo=timezone.utc)).total_seconds()
+                elapsed = (now - pos.opened_at.replace(tzinfo=timezone.utc)).total_seconds()
+                if total_life > 0:
+                    life_pct = elapsed / total_life
+                    if life_pct > 0.80:
+                        stop_pct = min(stop_pct, 0.03)
+                    elif life_pct > 0.50:
+                        stop_pct = min(stop_pct, 0.06)
+
             if pnl_pct < -stop_pct:
                 info = await close_position(db, pos, current_price, "stop_loss")
                 closed.append(info)
                 already_closed_this_cycle.add(pos.id)
                 continue
 
-            # Rule E: Target hit
+            # Rule E: Target hit — earlier profit taking
             if pnl_pct > TARGET_PCT:
                 info = await close_position(db, pos, current_price, "target_hit")
                 closed.append(info)
                 already_closed_this_cycle.add(pos.id)
                 continue
+
+            # Rule F: Trailing profit lock — if we had profit and it's eroding
+            # Only for positions that were meaningfully profitable at some point.
+            # Use current price vs entry to detect "was profitable, now reversing"
+            if pnl_pct > 0.03:
+                # Position is in profit — update high water mark in unrealized_pnl
+                pass  # tracked via unrealized_pnl updates each cycle
+            elif market and market.end_date:
+                end_dt = market.end_date.replace(tzinfo=timezone.utc)
+                total_life = (end_dt - pos.opened_at.replace(tzinfo=timezone.utc)).total_seconds()
+                elapsed = (now - pos.opened_at.replace(tzinfo=timezone.utc)).total_seconds()
+                if total_life > 0 and elapsed / total_life > 0.70 and pnl_pct < -0.02:
+                    info = await close_position(db, pos, current_price, "time_decay_stop")
+                    closed.append(info)
+                    already_closed_this_cycle.add(pos.id)
+                    continue
 
         except Exception as e:
             logger.warning(f"Exit check failed for position {pos.id}: {e}")

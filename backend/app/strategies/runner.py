@@ -204,6 +204,15 @@ class StrategyRunner:
                 if not market:
                     continue
 
+                # Skip markets too close to resolution — entering with < 3 min
+                # remaining gives no time for the edge to work and creates
+                # binary coin-flip outcomes dominated by fees.
+                if market.end_date:
+                    from datetime import timezone as _tz
+                    _remaining = (market.end_date.replace(tzinfo=_tz.utc) - datetime.now(_tz.utc)).total_seconds() / 60
+                    if _remaining < 3:
+                        continue
+
                 current_price  = float(snap.midpoint or snap.best_bid or 0.5)
                 current_spread = float(snap.spread or 0.04)
                 current_depth  = float(snap.bid_depth or 200.0)
