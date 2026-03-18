@@ -132,5 +132,7 @@ class HighConvictionCopyStrategy(BaseStrategy):
             book_levels=book_levels,
             book_snapshot_id=book_snapshot_id,
             target_structure="single",
+            wallet_composite=w_composite,
+            signal_edge=float(signal.net_edge or 0),
         )
         return result.position

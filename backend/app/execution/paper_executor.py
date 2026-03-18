@@ -58,6 +58,8 @@ async def execute_paper_trade(
     is_hedge_leg: bool = False,
     target_structure: str = "single",
     rng_seed: int | None = None,
+    wallet_composite: float | None = None,
+    signal_edge: float | None = None,
 ) -> ExecutionResult:
     rng = random.Random(rng_seed) if rng_seed else random.Random()
 
@@ -165,6 +167,10 @@ async def execute_paper_trade(
     if actual_size > 0:
         notional = fill_price * actual_size
         from app.config import get_settings as _get_settings
+        # Conviction tier from wallet composite
+        _wc = wallet_composite or 0.0
+        _tier = "A" if _wc >= 0.55 else ("B" if _wc >= 0.40 else "C")
+
         position = PaperPosition(
             position_group_id=position_group_id,
             leg_index=leg_index,
@@ -182,6 +188,10 @@ async def execute_paper_trade(
             total_slippage=slippage,
             status="open",
             epoch=_get_settings().TRADE_EPOCH,
+            conviction_tier=_tier,
+            entry_edge=round(signal_edge, 4) if signal_edge else None,
+            entry_spread=round(abs(fill_price - market_price), 4),
+            wallet_composite_at_entry=round(_wc, 4) if _wc else None,
         )
         db.add(position)
         await db.flush()

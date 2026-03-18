@@ -140,6 +140,7 @@ class DirectCopyStrategy(BaseStrategy):
         if decision.decision != "accept":
             return None
 
+        _cb = signal.costs_breakdown or {}
         result = await execute_paper_trade(
             db=db,
             signal_id=signal.id,
@@ -157,5 +158,7 @@ class DirectCopyStrategy(BaseStrategy):
             fee_rate_bps=250,
             available_depth=100.0,
             target_structure="single",
+            wallet_composite=float(_cb.get("wallet_score", 0)),
+            signal_edge=float(signal.net_edge or 0),
         )
         return result.position

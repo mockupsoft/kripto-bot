@@ -82,6 +82,10 @@ class PaperPosition(UUIDPrimaryKey, Base):
     resolve_price: Mapped[float | None] = mapped_column(Numeric(8, 4), nullable=True)
     resolve_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     market_duration_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    conviction_tier: Mapped[str | None] = mapped_column(String(1), nullable=True)
+    entry_edge: Mapped[float | None] = mapped_column(Numeric(8, 4), nullable=True)
+    entry_spread: Mapped[float | None] = mapped_column(Numeric(8, 4), nullable=True)
+    wallet_composite_at_entry: Mapped[float | None] = mapped_column(Numeric(8, 4), nullable=True)
 
     __table_args__ = (
         Index("idx_positions_status", "status", opened_at.desc()),

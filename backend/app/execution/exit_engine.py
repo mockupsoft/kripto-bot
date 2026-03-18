@@ -530,12 +530,31 @@ async def run_exit_cycle(db: AsyncSession) -> dict[str, Any]:
                 already_closed_this_cycle.add(pos.id)
                 continue
 
-            # ── Layer B: No-progress exit ─────────────────────────────────
-            # Trade has consumed significant lifetime without working.
-            # Winner protection: if the position shows signs of being a
-            # potential winner, delay the no_progress threshold.
+            # ── Layer B: No-progress exit (tier-aware) ────────────────────
+            # Exit thresholds adapt to conviction tier:
+            #   A-tier: patient — good wallet, strong edge → more runway
+            #   B-tier: standard baseline
+            #   C-tier: aggressive — weak signal → cut fast
+            tier = getattr(pos, "conviction_tier", None) or "B"
 
-            # Detect potential winner signals
+            # Base thresholds by tier
+            if tier == "A":
+                _np_life_threshold = 0.45   # more patient
+                _np_pnl_threshold = 0.01
+                _np_winner_life = 0.65      # winner protection extends further
+                _np_winner_pnl = -0.005
+            elif tier == "C":
+                _np_life_threshold = 0.25   # cut fast
+                _np_pnl_threshold = 0.005
+                _np_winner_life = 0.45
+                _np_winner_pnl = -0.003
+            else:  # B-tier (default)
+                _np_life_threshold = 0.35
+                _np_pnl_threshold = 0.01
+                _np_winner_life = 0.55
+                _np_winner_pnl = -0.005
+
+            # Winner protection: detect potential winners
             _wallet_aligned = False
             if strategy in COPY_STRATEGIES and pos.source_wallet_id:
                 _wr = await db.execute(
@@ -550,22 +569,19 @@ async def run_exit_cycle(db: AsyncSession) -> dict[str, Any]:
                 )
                 _wallet_aligned = _wr.scalar_one_or_none() is not None
 
-            _edge_increased = await _check_ev_compression(db, pos, current_price, current_spread) is False
             _potential_winner = (
-                pnl_pct > 0.003          # current pnl > +0.3%
-                or _wallet_aligned        # wallet still trading same direction
+                pnl_pct > 0.003
+                or _wallet_aligned
             )
 
             if _potential_winner:
-                # Protect: delay threshold by +20% lifetime, require deeper loss
-                if life_pct > 0.55 and pnl_pct < -0.005:
+                if life_pct > _np_winner_life and pnl_pct < _np_winner_pnl:
                     info = await close_position(db, pos, current_price, "no_progress")
                     closed.append(info)
                     already_closed_this_cycle.add(pos.id)
                     continue
             else:
-                # Standard no_progress: >35% lifetime + pnl < 1%
-                if life_pct > 0.35 and pnl_pct < 0.01:
+                if life_pct > _np_life_threshold and pnl_pct < _np_pnl_threshold:
                     info = await close_position(db, pos, current_price, "no_progress")
                     closed.append(info)
                     already_closed_this_cycle.add(pos.id)
@@ -574,12 +590,26 @@ async def run_exit_cycle(db: AsyncSession) -> dict[str, Any]:
             # ── Layer C: Time-decay exit ──────────────────────────────────
             # Tighten tolerance as market approaches resolution.
 
-            # C1: Stop loss with time-decay tightening
+            # C1: Stop loss with tier-aware time-decay tightening
             stop_pct = float(get_settings().STOP_LOSS_PCT)
-            if life_pct > 0.85:
-                stop_pct = min(stop_pct, 0.03)
-            elif life_pct > 0.50:
-                stop_pct = min(stop_pct, 0.06)
+            if tier == "A":
+                # A-tier: wider stops, later tightening
+                if life_pct > 0.85:
+                    stop_pct = min(stop_pct, 0.05)
+                elif life_pct > 0.60:
+                    stop_pct = min(stop_pct, 0.08)
+            elif tier == "C":
+                # C-tier: tight stops, early tightening
+                if life_pct > 0.70:
+                    stop_pct = min(stop_pct, 0.02)
+                elif life_pct > 0.40:
+                    stop_pct = min(stop_pct, 0.04)
+            else:
+                # B-tier: standard
+                if life_pct > 0.85:
+                    stop_pct = min(stop_pct, 0.03)
+                elif life_pct > 0.50:
+                    stop_pct = min(stop_pct, 0.06)
 
             if pnl_pct < -stop_pct:
                 info = await close_position(db, pos, current_price, "stop_loss")
