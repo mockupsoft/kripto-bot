@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db
 from app.models.paper import PaperFill, PaperOrder, PaperPosition
-from app.models.market import Market
+from app.models.market import Market, MarketSnapshot
 
 router = APIRouter()
 
@@ -30,6 +30,7 @@ def _serialize_position(p: PaperPosition, market_question: str | None = None) ->
         "total_slippage": float(p.total_slippage) if p.total_slippage else None,
         "status": p.status,
         "exit_reason": p.exit_reason,
+        "epoch": p.epoch,
         "opened_at": p.opened_at.isoformat() if p.opened_at else None,
         "closed_at": p.closed_at.isoformat() if p.closed_at else None,
         "target_structure": p.target_structure,
@@ -92,6 +93,33 @@ async def list_trades(
         mkts = await db.execute(select(Market).where(Market.id.in_(market_ids)))
         for m in mkts.scalars().all():
             mkt_map[m.id] = m.question
+
+    # Live PnL: compute unrealized_pnl from latest snapshot for open positions
+    open_market_ids = [p.market_id for p in positions if p.status == "open"]
+    live_prices: dict = {}
+    if open_market_ids:
+        snap_subq = (
+            select(MarketSnapshot.market_id, func.max(MarketSnapshot.captured_at).label("latest"))
+            .where(MarketSnapshot.market_id.in_(open_market_ids))
+            .group_by(MarketSnapshot.market_id)
+            .subquery()
+        )
+        snap_rows = await db.execute(
+            select(MarketSnapshot)
+            .join(snap_subq, (MarketSnapshot.market_id == snap_subq.c.market_id) & (MarketSnapshot.captured_at == snap_subq.c.latest))
+        )
+        for s in snap_rows.scalars().all():
+            live_prices[s.market_id] = float(s.midpoint or s.last_trade_price or 0)
+
+    for p in positions:
+        if p.status == "open" and p.market_id in live_prices:
+            current = live_prices[p.market_id]
+            entry = float(p.avg_entry_price or 0)
+            size = float(p.total_size or 0)
+            if p.side == "BUY":
+                p.unrealized_pnl = (current - entry) * size
+            else:
+                p.unrealized_pnl = (entry - current) * size
 
     # Distinct strategy values for filter dropdown
     strat_q = await db.execute(
