@@ -60,6 +60,7 @@ async def execute_paper_trade(
     rng_seed: int | None = None,
     wallet_composite: float | None = None,
     signal_edge: float | None = None,
+    market_question: str | None = None,
 ) -> ExecutionResult:
     rng = random.Random(rng_seed) if rng_seed else random.Random()
 
@@ -167,9 +168,31 @@ async def execute_paper_trade(
     if actual_size > 0:
         notional = fill_price * actual_size
         from app.config import get_settings as _get_settings
-        # Conviction tier from wallet composite
         _wc = wallet_composite or 0.0
         _tier = "A" if _wc >= 0.55 else ("B" if _wc >= 0.40 else "C")
+
+        # Market type classification
+        if not market_question:
+            from app.models.market import Market as _Mkt
+            from sqlalchemy import select as _sel
+            _mkt_r = await db.execute(_sel(_Mkt).where(_Mkt.id == market_id))
+            _mkt_obj = _mkt_r.scalar_one_or_none()
+            market_question = _mkt_obj.question if _mkt_obj else ""
+        _mq = (market_question or "").lower()
+        if "up or down" in _mq:
+            _mtype = "crypto_short"
+        elif any(k in _mq for k in ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp", "crypto"]):
+            _mtype = "crypto_long"
+        elif any(k in _mq for k in ["counter-strike", "valorant", "dota", "bo3", "bo5", "esport"]):
+            _mtype = "esports"
+        elif any(k in _mq for k in ["vs.", "win on", "spread:", "o/u ", "moneyline"]):
+            _mtype = "sports"
+        elif any(k in _mq for k in ["temperature", "weather", "rain"]):
+            _mtype = "weather"
+        elif any(k in _mq for k in ["president", "election", "democrat", "republican", "governor", "mayor", "nominee"]):
+            _mtype = "politics"
+        else:
+            _mtype = "other"
 
         position = PaperPosition(
             position_group_id=position_group_id,
@@ -189,6 +212,7 @@ async def execute_paper_trade(
             status="open",
             epoch=_get_settings().TRADE_EPOCH,
             conviction_tier=_tier,
+            market_type=_mtype,
             entry_edge=round(signal_edge, 4) if signal_edge else None,
             entry_spread=round(abs(fill_price - market_price), 4),
             wallet_composite_at_entry=round(_wc, 4) if _wc else None,

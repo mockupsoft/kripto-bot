@@ -2596,6 +2596,16 @@ async def get_epoch_deep_analytics(
             "killed_count": len([o for o in no_progress_outcomes if o.get("resolve_price") and not o.get("saved")]),
             "outcomes": no_progress_outcomes,
         },
+        "by_market_type": {
+            mtype: {
+                "trades": len(mt_pos),
+                "wins": len([p for p in mt_pos if (p.realized_pnl or 0) > 0]),
+                "avg_pnl": round(sum(float(p.realized_pnl or 0) for p in mt_pos) / len(mt_pos), 4) if mt_pos else 0,
+                "total_pnl": round(sum(float(p.realized_pnl or 0) for p in mt_pos), 4),
+            }
+            for mtype in set(getattr(p, "market_type", None) or "unknown" for p in positions)
+            if (mt_pos := [p for p in positions if (getattr(p, "market_type", None) or "unknown") == mtype])
+        },
         "by_conviction_tier": {
             tier: {
                 "trades": len(tier_pos),
