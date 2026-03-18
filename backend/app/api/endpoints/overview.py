@@ -27,8 +27,8 @@ async def get_overview(db: AsyncSession = Depends(get_db)) -> dict:
     )
 
     return {
-        "paper_balance": float(snap.cash_balance) if snap else 900.0,
-        "total_equity": float(snap.total_equity) if snap else 900.0,
+        "paper_balance": float(snap.cash_balance) if snap else 5000.0,
+        "total_equity": float(snap.total_equity) if snap else 5000.0,
         "unrealized_pnl": float(snap.unrealized_pnl) if snap else 0.0,
         "realized_pnl": float(snap.realized_pnl_cumulative) if snap else 0.0,
         "open_positions": open_count.scalar() or 0,

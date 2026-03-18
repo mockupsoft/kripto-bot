@@ -36,9 +36,9 @@ async def run_seed() -> None:
         db.add(SlippageProfile(name="optimistic", base_slippage_bps=10, volatility_multiplier=1.0, depth_factor=0.3, use_book_walking=True, is_default=False))
         db.add(SlippageProfile(name="pessimistic", base_slippage_bps=40, volatility_multiplier=2.5, depth_factor=1.0, use_book_walking=True, is_default=False))
 
-        db.add(RiskProfile(name="default", starting_balance=900.0, is_default=True))
-        db.add(RiskProfile(name="conservative", starting_balance=900.0, max_position_pct=0.05, max_total_exposure_pct=0.12, kelly_fraction=0.15, is_default=False))
-        db.add(RiskProfile(name="aggressive", starting_balance=900.0, max_position_pct=0.12, max_total_exposure_pct=0.30, kelly_fraction=0.40, is_default=False))
+        db.add(RiskProfile(name="default", starting_balance=5000.0, is_default=True))
+        db.add(RiskProfile(name="conservative", starting_balance=5000.0, max_position_pct=0.05, max_total_exposure_pct=0.12, kelly_fraction=0.15, is_default=False))
+        db.add(RiskProfile(name="aggressive", starting_balance=5000.0, max_position_pct=0.12, max_total_exposure_pct=0.30, kelly_fraction=0.40, is_default=False))
 
         await db.flush()
 

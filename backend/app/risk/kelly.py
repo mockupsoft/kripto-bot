@@ -21,7 +21,7 @@ def kelly_size(
     payoff_ratio: float = 1.0,
     kelly_fraction: float = 0.25,
     max_position_pct: float = 0.08,
-    available_bankroll: float = 900.0,
+    available_bankroll: float = 5000.0,
     model_confidence: float = 1.0,
 ) -> KellyResult:
     """Compute position size using fractional Kelly criterion.

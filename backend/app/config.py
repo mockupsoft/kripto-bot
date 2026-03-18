@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     STOP_LOSS_PCT: float = 0.10           # was 0.08 — "edge var ama sabır yok"; 10% gives more room
     STALE_MARKET_BLACKLIST: str = ""     # comma-separated market UUIDs; from top_markets_by_stale_count
 
+    # Paper trading bankroll
+    STARTING_BALANCE: float = 5000.0
+
     # Direct copy wallet gate (Phase 1)
     DIRECT_COPY_MIN_COMPOSITE: float = 0.35   # high_conviction 0.5'tan daha gevşek
     DIRECT_COPY_MIN_COPYABILITY: float = 0.0  # Phase 1'de sadece composite; tek değişken deneyi

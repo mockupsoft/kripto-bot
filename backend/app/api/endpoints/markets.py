@@ -364,9 +364,9 @@ async def get_actionability(db: AsyncSession = Depends(get_db)) -> dict:
             q = 1.0 - p
             kelly_f = max(0.0, (b * p - q) / max(b, 1e-8))
             fractional_kelly = kelly_f * 0.25  # 25% Kelly — conservative
-            bankroll = 900.0
+            bankroll = 5000.0
             raw_size = fractional_kelly * bankroll
-            suggested_size_usd = round(min(raw_size, 72.0), 2)  # cap at 8% bankroll
+            suggested_size_usd = round(min(raw_size, 400.0), 2)  # cap at 8% bankroll
 
         # ── Why not tradeable? (single-sentence primary blocker) ─
         why_not: str | None = None

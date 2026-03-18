@@ -127,7 +127,7 @@ async def check_exposure(
     )
 
 
-async def get_current_bankroll(db: AsyncSession, starting_balance: float = 900.0) -> float:
+async def get_current_bankroll(db: AsyncSession, starting_balance: float = 5000.0) -> float:
     """Get current cash balance from latest portfolio snapshot."""
     result = await db.execute(
         select(PortfolioSnapshot).order_by(PortfolioSnapshot.captured_at.desc()).limit(1)

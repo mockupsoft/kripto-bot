@@ -25,7 +25,7 @@ class MonteCarloResult:
 def run_monte_carlo(
     n_simulations: int = 600,
     n_trades: int = 100,
-    starting_capital: float = 900.0,
+    starting_capital: float = 5000.0,
     win_probability: float = 0.55,
     avg_win_pct: float = 0.03,
     avg_loss_pct: float = 0.025,

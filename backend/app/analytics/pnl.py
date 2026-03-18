@@ -13,7 +13,7 @@ from app.models.portfolio import PortfolioSnapshot
 
 async def compute_portfolio_snapshot(
     db: AsyncSession,
-    starting_balance: float = 900.0,
+    starting_balance: float = 5000.0,
     run_id=None,
     config_hash: str | None = None,
 ) -> PortfolioSnapshot:

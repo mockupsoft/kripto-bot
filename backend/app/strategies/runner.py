@@ -351,7 +351,8 @@ class StrategyRunner:
                             stats["strategy_funnel"]["dislocation"]["trades_executed"] += 1
 
         # 7. Portfolio snapshot
-        await compute_portfolio_snapshot(db, starting_balance=900.0)
+        from app.config import get_settings as _gs
+        await compute_portfolio_snapshot(db, starting_balance=_gs().STARTING_BALANCE)
 
         return stats
 

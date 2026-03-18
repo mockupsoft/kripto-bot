@@ -30,7 +30,7 @@ async def check_kill_switch(
     db: AsyncSession,
     consecutive_loss_limit: int = 15,
     daily_loss_stop_pct: float = 0.20,
-    starting_balance: float = 900.0,
+    starting_balance: float = 5000.0,
 ) -> KillSwitchStatus:
     """Check if the system should stop trading.
 

@@ -364,7 +364,7 @@ class SignalFilter:
         result: FilterResult,
         kelly_fraction: float = 0,
         proposed_size: float = 0,
-        available_bankroll: float = 900,
+        available_bankroll: float = 5000,
         current_exposure_pct: float = 0,
         latency_profile_id=None,
         slippage_profile_id=None,

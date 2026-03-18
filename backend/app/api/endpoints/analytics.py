@@ -31,8 +31,8 @@ async def get_equity_curve(
         "equity_curve": [
             {
                 "time": s.captured_at.isoformat(),
-                "equity": float(s.total_equity) if s.total_equity else 900.0,
-                "cash": float(s.cash_balance) if s.cash_balance else 900.0,
+                "equity": float(s.total_equity) if s.total_equity else 5000.0,
+                "cash": float(s.cash_balance) if s.cash_balance else 5000.0,
                 "drawdown": float(s.max_drawdown) if s.max_drawdown else 0.0,
             }
             for s in snaps
@@ -72,7 +72,8 @@ async def get_metrics(db: AsyncSession = Depends(get_db)) -> dict:
     pnl_series = [float(p.realized_pnl) for p in positions if p.realized_pnl]
     max_drawdown = 0.0
     if pnl_series:
-        bankroll = 900.0
+        from app.config import get_settings as _gs
+        bankroll = _gs().STARTING_BALANCE
         peak = bankroll
         cumulative = bankroll
         for pnl in pnl_series:
@@ -101,7 +102,7 @@ async def get_metrics(db: AsyncSession = Depends(get_db)) -> dict:
         "profit_factor": total_wins / total_losses if total_losses > 0 else float("inf"),
         "max_drawdown": max_drawdown,
         "expectancy": round(expectancy, 4),
-        "expectancy_pct": round(expectancy / 900 * 100, 4),  # as % of starting bankroll
+        "expectancy_pct": round(expectancy / 5000 * 100, 4),  # as % of starting bankroll
         "avg_trade_pnl": round(gross_pnl / len(positions), 4) if positions else 0,
     }
 
@@ -235,7 +236,7 @@ async def get_per_strategy(db: AsyncSession = Depends(get_db)) -> dict:
             "avg_loss": round(avg_loss, 4),
             "profit_factor": round(profit_factor, 3) if profit_factor != float("inf") else None,
             "expectancy": round(expectancy, 4),
-            "expectancy_pct": round(expectancy / 900.0 * 100, 4),
+            "expectancy_pct": round(expectancy / 5000.0 * 100, 4),
             "max_drawdown": round(max_dd, 4),
             "gross_profit": round(gross_profit, 4),
             "gross_loss": round(gross_loss, 4),

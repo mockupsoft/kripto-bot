@@ -79,8 +79,9 @@ services:
       # Research mode: kill switch disabled so direct_copy/high_conviction keep trading for data
       - STRATEGY_RESEARCH_MODE=true
       # Risk / position limits — tunable without rebuild
-      - MAX_OPEN_POSITIONS_GLOBAL=40
-      - MAX_POSITIONS_PER_WALLET=3
+      - MAX_OPEN_POSITIONS_GLOBAL=100
+      - MAX_POSITIONS_PER_WALLET=5
+      - STARTING_BALANCE=5000
       # Cost regime filters — primary gate for cost/gross ratio
       - MIN_CONF_EDGE=0.005
       - MAX_SPREAD_TO_EDGE=0.6
