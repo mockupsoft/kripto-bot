@@ -46,12 +46,20 @@ async def list_trades(
     status: str | None = Query(None, description="open | closed"),
     strategy: str | None = Query(None),
     exit_reason: str | None = Query(None),
+    epoch: str | None = Query(None, description="Filter by epoch. Default: current epoch."),
+    all_epochs: bool = Query(False, description="Show all epochs (override default filter)"),
     hide_zero_pnl: bool = Query(False, description="Exclude closed positions with PnL=0"),
     limit: int = Query(50, le=500),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    from app.config import get_settings as _gs
     base = select(PaperPosition)
+
+    # Default: show only current epoch unless all_epochs=true
+    if not all_epochs:
+        _epoch = epoch or _gs().TRADE_EPOCH
+        base = base.where(PaperPosition.epoch == _epoch)
 
     if status:
         base = base.where(PaperPosition.status == status)
@@ -72,9 +80,14 @@ async def list_trades(
     count_q = select(func.count()).select_from(base.subquery())
     total = (await db.execute(count_q)).scalar() or 0
 
-    # Global open/closed counts (unfiltered — for summary bar)
-    total_open_q   = select(func.count()).where(PaperPosition.status == "open")
-    total_closed_q = select(func.count()).where(PaperPosition.status == "closed")
+    # Global open/closed counts (epoch-scoped for summary bar)
+    _active_epoch = epoch or _gs().TRADE_EPOCH if not all_epochs else None
+    if _active_epoch:
+        total_open_q   = select(func.count()).where(PaperPosition.status == "open", PaperPosition.epoch == _active_epoch)
+        total_closed_q = select(func.count()).where(PaperPosition.status == "closed", PaperPosition.epoch == _active_epoch)
+    else:
+        total_open_q   = select(func.count()).where(PaperPosition.status == "open")
+        total_closed_q = select(func.count()).where(PaperPosition.status == "closed")
     total_open   = (await db.execute(total_open_q)).scalar()   or 0
     total_closed = (await db.execute(total_closed_q)).scalar() or 0
 
