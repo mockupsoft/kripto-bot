@@ -2421,6 +2421,188 @@ async def get_edge_calibration(db: AsyncSession = Depends(get_db)) -> dict:
     }
 
 
+@router.get("/epoch-deep")
+async def get_epoch_deep_analytics(
+    db: AsyncSession = Depends(get_db),
+    epoch: str = Query(default="smart_exit_v1"),
+):
+    """Deep cohort analytics: killed winners, saved losers, duration buckets,
+    exit-reason breakdown, and no-progress post-exit analysis."""
+    result = await db.execute(
+        select(PaperPosition)
+        .where(PaperPosition.status == "closed", PaperPosition.epoch == epoch)
+        .order_by(PaperPosition.closed_at.asc())
+    )
+    positions = result.scalars().all()
+
+    if not positions:
+        return {"epoch": epoch, "total_trades": 0, "message": "No closed trades yet."}
+
+    from app.execution.exit_engine import EARLY_EXIT_REASONS
+
+    # ── 1. Killed winners / Saved losers ──────────────────────────
+    killed_winners = 0
+    saved_losers = 0
+    resolve_pending = 0
+    early_exits_detail: list[dict] = []
+
+    for p in positions:
+        if (p.exit_reason or "") not in EARLY_EXIT_REASONS:
+            continue
+        entry = float(p.avg_entry_price or 0)
+        exit_px = float(p.avg_exit_price or 0)
+        rp = float(p.resolve_price) if p.resolve_price is not None else None
+
+        detail = {
+            "side": p.side,
+            "entry": round(entry, 4),
+            "exit_price": round(exit_px, 4),
+            "resolve_price": round(rp, 4) if rp else None,
+            "actual_pnl": round(float(p.realized_pnl or 0), 4),
+            "exit_reason": p.exit_reason,
+            "hold_minutes": round((p.closed_at - p.opened_at).total_seconds() / 60, 1) if p.closed_at and p.opened_at else None,
+        }
+
+        if rp is not None:
+            size = float(p.total_size or 0)
+            fees = float(p.total_fees or 0) + float(p.total_slippage or 0)
+            if p.side == "BUY":
+                would_have_pnl = (rp - entry) * size - fees
+            else:
+                would_have_pnl = (entry - rp) * size - fees
+
+            detail["would_have_pnl"] = round(would_have_pnl, 4)
+            if would_have_pnl > 0:
+                killed_winners += 1
+                detail["verdict"] = "killed_winner"
+            else:
+                saved_losers += 1
+                detail["verdict"] = "saved_loser"
+        else:
+            resolve_pending += 1
+            detail["verdict"] = "pending_resolve"
+
+        early_exits_detail.append(detail)
+
+    # ── 2. Exit-reason performance breakdown ──────────────────────
+    exit_breakdown: dict[str, dict] = {}
+    for p in positions:
+        r = p.exit_reason or "unknown"
+        if r not in exit_breakdown:
+            exit_breakdown[r] = {"count": 0, "wins": 0, "total_pnl": 0, "total_hold": 0}
+        b = exit_breakdown[r]
+        b["count"] += 1
+        pnl = float(p.realized_pnl or 0)
+        b["total_pnl"] += pnl
+        if pnl > 0:
+            b["wins"] += 1
+        if p.closed_at and p.opened_at:
+            b["total_hold"] += (p.closed_at - p.opened_at).total_seconds() / 60
+
+    for r, b in exit_breakdown.items():
+        b["avg_pnl"] = round(b["total_pnl"] / b["count"], 4) if b["count"] else 0
+        b["win_rate"] = round(b["wins"] / b["count"], 3) if b["count"] else 0
+        b["avg_hold_min"] = round(b["total_hold"] / b["count"], 1) if b["count"] else 0
+        b["total_pnl"] = round(b["total_pnl"], 4)
+
+    # ── 3. Duration-bucket analytics ──────────────────────────────
+    buckets_def = [(6, 10, "6-10min"), (10, 20, "10-20min"), (20, 60, "20-60min"), (60, 9999, "60+min")]
+    duration_buckets: dict[str, dict] = {}
+
+    for p in positions:
+        if not p.closed_at or not p.opened_at:
+            continue
+        hold = (p.closed_at - p.opened_at).total_seconds() / 60
+        bucket_name = None
+        for lo, hi, name in buckets_def:
+            if lo <= hold < hi:
+                bucket_name = name
+                break
+        if not bucket_name:
+            bucket_name = "<6min"
+
+        if bucket_name not in duration_buckets:
+            duration_buckets[bucket_name] = {"trades": 0, "wins": 0, "total_pnl": 0, "exit_reasons": {}}
+        db_entry = duration_buckets[bucket_name]
+        db_entry["trades"] += 1
+        pnl = float(p.realized_pnl or 0)
+        db_entry["total_pnl"] += pnl
+        if pnl > 0:
+            db_entry["wins"] += 1
+        er = p.exit_reason or "unknown"
+        db_entry["exit_reasons"][er] = db_entry["exit_reasons"].get(er, 0) + 1
+
+    for name, b in duration_buckets.items():
+        b["avg_pnl"] = round(b["total_pnl"] / b["trades"], 4) if b["trades"] else 0
+        b["win_rate"] = round(b["wins"] / b["trades"], 3) if b["trades"] else 0
+        b["total_pnl"] = round(b["total_pnl"], 4)
+
+    # ── 4. No-progress post-exit outcome ──────────────────────────
+    no_progress_outcomes: list[dict] = []
+    for p in positions:
+        if p.exit_reason != "no_progress":
+            continue
+        entry = float(p.avg_entry_price or 0)
+        rp = float(p.resolve_price) if p.resolve_price is not None else None
+        actual = float(p.realized_pnl or 0)
+
+        outcome = {
+            "actual_pnl": round(actual, 4),
+            "resolve_price": round(rp, 4) if rp else None,
+        }
+        if rp is not None:
+            size = float(p.total_size or 0)
+            fees = float(p.total_fees or 0) + float(p.total_slippage or 0)
+            if p.side == "BUY":
+                resolve_pnl = (rp - entry) * size - fees
+            else:
+                resolve_pnl = (entry - rp) * size - fees
+            outcome["would_have_pnl"] = round(resolve_pnl, 4)
+            outcome["saved"] = resolve_pnl <= 0
+        no_progress_outcomes.append(outcome)
+
+    # ── 5. Summary ────────────────────────────────────────────────
+    wins = [p for p in positions if (p.realized_pnl or 0) > 0]
+    losses = [p for p in positions if (p.realized_pnl or 0) <= 0]
+    total_wins = sum(float(p.realized_pnl) for p in wins)
+    total_losses = sum(abs(float(p.realized_pnl)) for p in losses)
+
+    return {
+        "epoch": epoch,
+        "total_trades": len(positions),
+        "net_pnl": round(sum(float(p.realized_pnl or 0) for p in positions), 4),
+        "win_rate": round(len(wins) / len(positions), 4) if positions else 0,
+        "avg_win": round(total_wins / len(wins), 4) if wins else 0,
+        "avg_loss": round(total_losses / len(losses), 4) if losses else 0,
+        "profit_factor": round(total_wins / total_losses, 3) if total_losses > 0 else None,
+        "killed_winners_vs_saved_losers": {
+            "killed_winners": killed_winners,
+            "saved_losers": saved_losers,
+            "resolve_pending": resolve_pending,
+            "verdict": (
+                "saved_losers_dominant" if saved_losers > killed_winners * 1.5
+                else "killed_winners_dominant" if killed_winners > saved_losers * 1.5
+                else "balanced" if killed_winners + saved_losers > 0
+                else "insufficient_data"
+            ),
+            "detail": early_exits_detail,
+        },
+        "exit_reason_breakdown": exit_breakdown,
+        "duration_buckets": duration_buckets,
+        "no_progress_analysis": {
+            "total": len(no_progress_outcomes),
+            "with_resolve": len([o for o in no_progress_outcomes if o.get("resolve_price")]),
+            "saved_count": len([o for o in no_progress_outcomes if o.get("saved")]),
+            "killed_count": len([o for o in no_progress_outcomes if o.get("resolve_price") and not o.get("saved")]),
+            "outcomes": no_progress_outcomes,
+        },
+        "checkpoints": {
+            "20_trades": len(positions) >= 20,
+            "50_trades": len(positions) >= 50,
+        },
+    }
+
+
 @router.get("/epoch")
 async def get_epoch_analytics(
     db: AsyncSession = Depends(get_db),

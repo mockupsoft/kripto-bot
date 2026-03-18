@@ -574,6 +574,14 @@ async def run_exit_cycle(db: AsyncSession) -> dict[str, Any]:
             logger.error(f"Exit cycle commit failed: {e}")
             await db.rollback()
 
+    # Backfill resolve prices for early-exited positions (~10% of cycles)
+    import random as _rnd
+    if _rnd.random() < 0.10:
+        try:
+            await backfill_resolve_prices(db)
+        except Exception as e:
+            logger.debug(f"Resolve backfill error: {e}")
+
     return {
         "checked": len(positions),
         "closed": len(closed),
@@ -590,3 +598,82 @@ def _summarize_exits(closed: list[dict]) -> dict[str, int]:
         reason = c.get("exit_reason", "unknown")
         summary[reason] = summary.get(reason, 0) + 1
     return summary
+
+
+# Early-exit reasons that need resolve_price backfill for killed/saved analysis
+EARLY_EXIT_REASONS = {"no_progress", "stop_loss", "time_decay_stop", "wallet_reversal", "ev_compression"}
+
+
+async def backfill_resolve_prices(db: AsyncSession) -> int:
+    """For early-exited positions, fetch the eventual resolve price.
+
+    This runs periodically to check if markets that we exited early
+    have since resolved. The resolve_price lets us compute whether
+    the early exit was a saved_loser or killed_winner.
+    """
+    import httpx
+
+    now = datetime.now(timezone.utc)
+    result = await db.execute(
+        select(PaperPosition)
+        .where(
+            PaperPosition.status == "closed",
+            PaperPosition.exit_reason.in_(list(EARLY_EXIT_REASONS)),
+            PaperPosition.resolve_price.is_(None),
+            PaperPosition.resolve_checked_at.is_(None)
+            | (PaperPosition.resolve_checked_at < now - timedelta(hours=1)),
+        )
+        .limit(20)
+    )
+    positions = result.scalars().all()
+    if not positions:
+        return 0
+
+    market_ids = list({p.market_id for p in positions})
+    mkt_result = await db.execute(select(Market).where(Market.id.in_(market_ids)))
+    markets = {m.id: m for m in mkt_result.scalars().all()}
+
+    filled = 0
+    for pos in positions:
+        market = markets.get(pos.market_id)
+        if not market:
+            pos.resolve_checked_at = now
+            continue
+
+        resolve_px = None
+
+        if not market.is_active:
+            resolve_px_result = await _fetch_resolution_price(market, pos.side or "BUY")
+            if resolve_px_result is not None:
+                resolve_px = resolve_px_result
+            else:
+                snap = await get_latest_snapshot(db, pos.market_id)
+                if snap:
+                    px = float(snap.midpoint or snap.last_trade_price or 0)
+                    if px < 0.05 or px > 0.95:
+                        resolve_px = px
+
+        if market.end_date:
+            end_dt = market.end_date.replace(tzinfo=timezone.utc)
+            hours_past = (now - end_dt).total_seconds() / 3600
+            if hours_past > 3 and resolve_px is None:
+                rp = await _fetch_resolution_price(market, pos.side or "BUY")
+                if rp is not None:
+                    resolve_px = rp
+
+        if resolve_px is not None:
+            pos.resolve_price = resolve_px
+            entry = float(pos.avg_entry_price or 0)
+            size = float(pos.total_size or 0)
+            if pos.side == "BUY":
+                pos.market_duration_minutes = int(
+                    (pos.closed_at - pos.opened_at).total_seconds() / 60
+                ) if pos.closed_at and pos.opened_at else None
+            filled += 1
+
+        pos.resolve_checked_at = now
+
+    if filled:
+        await db.commit()
+        logger.info(f"Backfilled resolve_price for {filled} early-exited positions")
+    return filled

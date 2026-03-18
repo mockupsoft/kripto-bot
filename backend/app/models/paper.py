@@ -79,6 +79,9 @@ class PaperPosition(UUIDPrimaryKey, Base):
     exit_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="open")
     epoch: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    resolve_price: Mapped[float | None] = mapped_column(Numeric(8, 4), nullable=True)
+    resolve_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    market_duration_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
         Index("idx_positions_status", "status", opened_at.desc()),
