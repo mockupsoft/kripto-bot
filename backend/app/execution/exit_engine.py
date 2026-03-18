@@ -642,24 +642,20 @@ async def backfill_resolve_prices(db: AsyncSession) -> int:
 
         resolve_px = None
 
-        if not market.is_active:
-            resolve_px_result = await _fetch_resolution_price(market, pos.side or "BUY")
-            if resolve_px_result is not None:
-                resolve_px = resolve_px_result
+        # Try API for any market past end_date (don't require is_active=False)
+        should_check = (not market.is_active) or (
+            market.end_date and market.end_date.replace(tzinfo=timezone.utc) < now
+        )
+        if should_check:
+            rp = await _fetch_resolution_price(market, pos.side or "BUY")
+            if rp is not None:
+                resolve_px = rp
             else:
                 snap = await get_latest_snapshot(db, pos.market_id)
                 if snap:
                     px = float(snap.midpoint or snap.last_trade_price or 0)
-                    if px < 0.05 or px > 0.95:
+                    if px < 0.10 or px > 0.90:
                         resolve_px = px
-
-        if market.end_date:
-            end_dt = market.end_date.replace(tzinfo=timezone.utc)
-            hours_past = (now - end_dt).total_seconds() / 3600
-            if hours_past > 3 and resolve_px is None:
-                rp = await _fetch_resolution_price(market, pos.side or "BUY")
-                if rp is not None:
-                    resolve_px = rp
 
         if resolve_px is not None:
             pos.resolve_price = resolve_px
