@@ -164,6 +164,7 @@ async def execute_paper_trade(
     position = None
     if actual_size > 0:
         notional = fill_price * actual_size
+        from app.config import get_settings as _get_settings
         position = PaperPosition(
             position_group_id=position_group_id,
             leg_index=leg_index,
@@ -180,6 +181,7 @@ async def execute_paper_trade(
             total_fees=fee,
             total_slippage=slippage,
             status="open",
+            epoch=_get_settings().TRADE_EPOCH,
         )
         db.add(position)
         await db.flush()

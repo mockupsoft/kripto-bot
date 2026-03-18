@@ -2419,3 +2419,87 @@ async def get_edge_calibration(db: AsyncSession = Depends(get_db)) -> dict:
             "pearson_r > 0.3 = well calibrated. Target: high_edge bucket shrinks, mid_edge grows."
         ),
     }
+
+
+@router.get("/epoch")
+async def get_epoch_analytics(
+    db: AsyncSession = Depends(get_db),
+    epoch: str = Query(default="smart_exit_v1"),
+):
+    """Analytics for a specific trade epoch (cohort isolation).
+
+    Tracks all key metrics for the specified epoch, isolating new
+    system performance from legacy trades.
+    """
+    result = await db.execute(
+        select(PaperPosition)
+        .where(PaperPosition.status == "closed", PaperPosition.epoch == epoch)
+        .order_by(PaperPosition.closed_at.asc())
+    )
+    positions = result.scalars().all()
+
+    if not positions:
+        return {
+            "epoch": epoch,
+            "total_trades": 0,
+            "message": "No closed trades in this epoch yet. Waiting for data.",
+            "checkpoints": {"20_trades": False, "50_trades": False},
+        }
+
+    wins = [p for p in positions if (p.realized_pnl or 0) > 0]
+    losses = [p for p in positions if (p.realized_pnl or 0) <= 0]
+
+    total_wins = sum(float(p.realized_pnl) for p in wins)
+    total_losses = sum(abs(float(p.realized_pnl)) for p in losses)
+
+    win_rate = len(wins) / len(positions) if positions else 0
+    avg_win = total_wins / len(wins) if wins else 0
+    avg_loss = total_losses / len(losses) if losses else 0
+    expectancy = win_rate * avg_win - (1 - win_rate) * avg_loss
+    pf = total_wins / total_losses if total_losses > 0 else float("inf")
+
+    exit_dist: dict[str, int] = {}
+    for p in positions:
+        r = p.exit_reason or "unknown"
+        exit_dist[r] = exit_dist.get(r, 0) + 1
+
+    # Hold time analysis
+    hold_times = []
+    for p in positions:
+        if p.closed_at and p.opened_at:
+            ht = (p.closed_at - p.opened_at).total_seconds() / 60
+            hold_times.append(ht)
+
+    # PnL by side
+    buy_pnl = sum(float(p.realized_pnl or 0) for p in positions if p.side == "BUY")
+    sell_pnl = sum(float(p.realized_pnl or 0) for p in positions if p.side == "SELL")
+    buy_cnt = len([p for p in positions if p.side == "BUY"])
+    sell_cnt = len([p for p in positions if p.side == "SELL"])
+
+    return {
+        "epoch": epoch,
+        "total_trades": len(positions),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": round(win_rate, 4),
+        "avg_win": round(avg_win, 4),
+        "avg_loss": round(avg_loss, 4),
+        "expectancy": round(expectancy, 4),
+        "profit_factor": round(pf, 3) if pf != float("inf") else None,
+        "net_pnl": round(sum(float(p.realized_pnl or 0) for p in positions), 4),
+        "by_side": {
+            "BUY": {"trades": buy_cnt, "pnl": round(buy_pnl, 2)},
+            "SELL": {"trades": sell_cnt, "pnl": round(sell_pnl, 2)},
+        },
+        "exit_distribution": exit_dist,
+        "avg_hold_minutes": round(sum(hold_times) / len(hold_times), 1) if hold_times else 0,
+        "checkpoints": {
+            "20_trades": len(positions) >= 20,
+            "50_trades": len(positions) >= 50,
+        },
+        "validation_status": (
+            "collecting" if len(positions) < 20
+            else "checkpoint_20" if len(positions) < 50
+            else "validated"
+        ),
+    }

@@ -475,8 +475,37 @@ async def run_exit_cycle(db: AsyncSession) -> dict[str, Any]:
             current_price = float(snap.midpoint or snap.last_trade_price or entry)
             current_spread = float(snap.spread or 0.04)
 
-            # ── Strategy-specific smart exits ─────────────────────────────────
+            # ────────────────────────────────────────────────────────────────
+            # SMART EXIT v1 — Three layers only:
+            #   Layer A: Signal invalidation (thesis no longer valid)
+            #   Layer B: No-progress exit (trade isn't working)
+            #   Layer C: Time-decay exit (tighten as resolution approaches)
+            # ────────────────────────────────────────────────────────────────
 
+            if pos.side == "BUY":
+                unrealized = (current_price - entry) * size
+            else:
+                unrealized = (entry - current_price) * size
+            pos.unrealized_pnl = unrealized
+
+            notional = entry * size
+            if notional <= 0:
+                continue
+            pnl_pct = unrealized / notional
+
+            # Compute market lifetime progress (0.0 = just opened, 1.0 = at end_date)
+            life_pct = 0.0
+            if market and market.end_date:
+                end_dt = market.end_date.replace(tzinfo=timezone.utc)
+                total_life = (end_dt - pos.opened_at.replace(tzinfo=timezone.utc)).total_seconds()
+                elapsed = (now - pos.opened_at.replace(tzinfo=timezone.utc)).total_seconds()
+                if total_life > 0:
+                    life_pct = min(elapsed / total_life, 2.0)
+
+            # ── Layer A: Signal invalidation ──────────────────────────────
+            # Entry thesis is no longer valid → exit regardless of PnL.
+
+            # A1: Wallet reversal (copy strategies)
             if strategy in COPY_STRATEGIES:
                 hold_minutes = (now - pos.opened_at.replace(tzinfo=timezone.utc)).total_seconds() / 60
                 if hold_minutes >= WALLET_REVERSAL_MIN_HOLD_MINUTES:
@@ -486,49 +515,40 @@ async def run_exit_cycle(db: AsyncSession) -> dict[str, Any]:
                         already_closed_this_cycle.add(pos.id)
                         continue
 
-            elif strategy in DISLOCATION_STRATEGIES:
-                # Rule B: Spread normalized (dislocation only)
+            # A2: Spread normalized (dislocation)
+            if strategy in DISLOCATION_STRATEGIES:
                 if await _check_spread_normalized(db, pos):
                     info = await close_position(db, pos, current_price, "spread_normalized")
                     closed.append(info)
                     already_closed_this_cycle.add(pos.id)
                     continue
 
-            # Rule C: EV compression (both strategy types)
+            # A3: EV compression — entry edge eroded > 70%
             if await _check_ev_compression(db, pos, current_price, current_spread):
                 info = await close_position(db, pos, current_price, "ev_compression")
                 closed.append(info)
                 already_closed_this_cycle.add(pos.id)
                 continue
 
-            # ── PnL-based exits ───────────────────────────────────────────────
-            if pos.side == "BUY":
-                unrealized = (current_price - entry) * size
-            else:
-                unrealized = (entry - current_price) * size
+            # ── Layer B: No-progress exit ─────────────────────────────────
+            # Trade has consumed significant lifetime without working.
 
-            pos.unrealized_pnl = unrealized
-
-            notional = entry * size
-            if notional <= 0:
+            # B1: >35% lifetime used and pnl is still flat or negative
+            if life_pct > 0.35 and pnl_pct < 0.01:
+                info = await close_position(db, pos, current_price, "no_progress")
+                closed.append(info)
+                already_closed_this_cycle.add(pos.id)
                 continue
 
-            pnl_pct = unrealized / notional
+            # ── Layer C: Time-decay exit ──────────────────────────────────
+            # Tighten tolerance as market approaches resolution.
 
-            # Rule D: Smart stop loss — time-decay tightening
-            # As market approaches resolution, tighten stop to reduce avg loss.
-            # Early: -10% stop. Past 50% of lifetime: -6%. Past 80%: -3%.
+            # C1: Stop loss with time-decay tightening
             stop_pct = float(get_settings().STOP_LOSS_PCT)
-            if market and market.end_date:
-                end_dt = market.end_date.replace(tzinfo=timezone.utc)
-                total_life = (end_dt - pos.opened_at.replace(tzinfo=timezone.utc)).total_seconds()
-                elapsed = (now - pos.opened_at.replace(tzinfo=timezone.utc)).total_seconds()
-                if total_life > 0:
-                    life_pct = elapsed / total_life
-                    if life_pct > 0.80:
-                        stop_pct = min(stop_pct, 0.03)
-                    elif life_pct > 0.50:
-                        stop_pct = min(stop_pct, 0.06)
+            if life_pct > 0.85:
+                stop_pct = min(stop_pct, 0.03)
+            elif life_pct > 0.50:
+                stop_pct = min(stop_pct, 0.06)
 
             if pnl_pct < -stop_pct:
                 info = await close_position(db, pos, current_price, "stop_loss")
@@ -536,28 +556,12 @@ async def run_exit_cycle(db: AsyncSession) -> dict[str, Any]:
                 already_closed_this_cycle.add(pos.id)
                 continue
 
-            # Rule E: Target hit — earlier profit taking
+            # C2: Target hit
             if pnl_pct > TARGET_PCT:
                 info = await close_position(db, pos, current_price, "target_hit")
                 closed.append(info)
                 already_closed_this_cycle.add(pos.id)
                 continue
-
-            # Rule F: Trailing profit lock — if we had profit and it's eroding
-            # Only for positions that were meaningfully profitable at some point.
-            # Use current price vs entry to detect "was profitable, now reversing"
-            if pnl_pct > 0.03:
-                # Position is in profit — update high water mark in unrealized_pnl
-                pass  # tracked via unrealized_pnl updates each cycle
-            elif market and market.end_date:
-                end_dt = market.end_date.replace(tzinfo=timezone.utc)
-                total_life = (end_dt - pos.opened_at.replace(tzinfo=timezone.utc)).total_seconds()
-                elapsed = (now - pos.opened_at.replace(tzinfo=timezone.utc)).total_seconds()
-                if total_life > 0 and elapsed / total_life > 0.70 and pnl_pct < -0.02:
-                    info = await close_position(db, pos, current_price, "time_decay_stop")
-                    closed.append(info)
-                    already_closed_this_cycle.add(pos.id)
-                    continue
 
         except Exception as e:
             logger.warning(f"Exit check failed for position {pos.id}: {e}")

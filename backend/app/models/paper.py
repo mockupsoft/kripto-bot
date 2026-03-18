@@ -78,9 +78,11 @@ class PaperPosition(UUIDPrimaryKey, Base):
     total_slippage: Mapped[float | None] = mapped_column(Numeric(10, 4), nullable=True)
     exit_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="open")
+    epoch: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (
         Index("idx_positions_status", "status", opened_at.desc()),
+        Index("idx_positions_epoch", "epoch", postgresql_where=(epoch.isnot(None))),
         Index(
             "idx_positions_group",
             "position_group_id",

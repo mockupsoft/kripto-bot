@@ -204,13 +204,14 @@ class StrategyRunner:
                 if not market:
                     continue
 
-                # Skip markets too close to resolution — entering with < 3 min
-                # remaining gives no time for the edge to work and creates
-                # binary coin-flip outcomes dominated by fees.
+                # Skip markets with insufficient remaining time.
+                # MIN_MARKET_DURATION_MINUTES (default 6) prevents entering
+                # ultra-short windows that resolve as coin flips.
                 if market.end_date:
                     from datetime import timezone as _tz
-                    _remaining = (market.end_date.replace(tzinfo=_tz.utc) - datetime.now(_tz.utc)).total_seconds() / 60
-                    if _remaining < 3:
+                    _remaining_min = (market.end_date.replace(tzinfo=_tz.utc) - datetime.now(_tz.utc)).total_seconds() / 60
+                    _min_dur = int(os.getenv("MIN_MARKET_DURATION_MINUTES", "6"))
+                    if _remaining_min < _min_dur:
                         continue
 
                 current_price  = float(snap.midpoint or snap.best_bid or 0.5)

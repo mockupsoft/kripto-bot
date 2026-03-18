@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     # Paper trading bankroll
     STARTING_BALANCE: float = 5000.0
 
+    # Smart Exit v1: market duration filter and epoch tagging
+    MIN_MARKET_DURATION_MINUTES: int = 6
+    TRADE_EPOCH: str = "smart_exit_v1"
+
     # Direct copy wallet gate (Phase 1)
     DIRECT_COPY_MIN_COMPOSITE: float = 0.35   # high_conviction 0.5'tan daha gevşek
     DIRECT_COPY_MIN_COPYABILITY: float = 0.0  # Phase 1'de sadece composite; tek değişken deneyi
