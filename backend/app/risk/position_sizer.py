@@ -28,7 +28,7 @@ def compute_position_size(
     market_price: float,
     available_bankroll: float,
     kelly_fraction: float = 0.25,
-    max_position_pct: float = 0.08,
+    max_position_pct: float = 0.015,
     confidence_factor: float = 1.0,
     side: str = "BUY",
     wallet_composite: float = 0.5,
