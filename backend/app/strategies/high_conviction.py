@@ -90,12 +90,14 @@ class HighConvictionCopyStrategy(BaseStrategy):
             position_counts=kwargs.get("position_counts"),
         )
 
+        w_composite = float(score.composite_score or 0.5) if score and score.composite_score is not None else 0.5
         sizing = compute_position_size(
             model_probability=float(signal.model_probability or 0.5),
             model_confidence=float(signal.model_confidence or 0.5),
             market_price=current_price,
             available_bankroll=bankroll,
             side=signal.side or "BUY",
+            wallet_composite=w_composite,
         )
 
         return await self._filter.record_decision(

@@ -194,6 +194,23 @@ class SignalFilter:
                 spread_at_decision=round(current_spread, 4),
             )
 
+        # ── Gate 1c: market quality — reject low-quality markets ──────────────
+        # Markets with wide spread relative to edge, or very low depth, produce
+        # fee-dominated trades regardless of wallet quality.
+        if current_spread > 0 and edge_at_decision > 0:
+            spread_edge_pct = current_spread / edge_at_decision
+            if spread_edge_pct > 2.0:
+                return FilterResult(
+                    decision="reject",
+                    reason=_reason(
+                        "MARKET_QUALITY_LOW",
+                        f"spread/edge={spread_edge_pct:.1f} > 2.0 (spread={current_spread:.4f}, edge={edge_at_decision:.4f})",
+                    ),
+                    edge_at_decision=round(edge_at_decision, 6),
+                    price_drift=round(price_drift, 6),
+                    spread_at_decision=round(current_spread, 4),
+                )
+
         # ── Gate 2: spread / liquidity gates (execution viability) ────────────
         if current_spread > self.max_spread:            return FilterResult(
                 decision="reject",

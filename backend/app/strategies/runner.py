@@ -218,6 +218,16 @@ class StrategyRunner:
                         continue
 
                     tx_side = getattr(tx, "side", None) or "BUY"
+
+                    # SELL copy disabled for direct_copy — data shows BUY 65% win
+                    # rate vs SELL 33%. Wallet SELL is often exit/hedge, not direction.
+                    # high_conviction SELL allowed only for high-quality wallets.
+                    if tx_side == "SELL":
+                        if strat_name == "direct_copy":
+                            continue
+                        if strat_name == "high_conviction" and w_composite < 0.55:
+                            continue
+
                     try:
                         signal = await self.signal_gen.generate_copy_signal(
                             db=db,

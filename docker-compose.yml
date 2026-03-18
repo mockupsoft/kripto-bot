@@ -96,6 +96,8 @@ services:
       - DISLO_MIN_EDGE=0.01
       - DISLO_MIN_DEPTH=50.0
       - DISLO_MAX_SPREAD=0.03
+      # Stale data: block new entries on stale markets, but don't force-close existing positions
+      - STALE_SOFT_GUARD=true
       # Ingestion performance: smaller batches = less peak memory
       - WALLET_INGEST_BATCH_SIZE=3
     depends_on:

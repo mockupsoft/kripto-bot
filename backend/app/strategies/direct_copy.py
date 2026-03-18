@@ -115,6 +115,7 @@ class DirectCopyStrategy(BaseStrategy):
             market_price=current_price,
             available_bankroll=bankroll,
             side=signal.side or "BUY",
+            wallet_composite=composite if composite is not None else 0.5,
         )
 
         decision = await self._filter.record_decision(
