@@ -2,35 +2,50 @@
 
 ## Cursor Cloud specific instructions
 
+### Mission and safety (non-negotiable)
+
+Kripto-Bot is a **Polymarket paper-trading research platform**. It is **DEMO-ONLY**.
+
+- Never add or enable real-money order execution.
+- Keep demo constraints enforced (`DEMO_MODE_ONLY = True` in backend settings).
+- If a change appears to introduce real execution, block it explicitly.
+
 ### Architecture overview
 
-Kripto-Bot is a **Polymarket paper-trading research platform** (DEMO-ONLY). It uses Docker Compose to orchestrate four services: PostgreSQL 16, Redis 7, a Python 3.12 / FastAPI backend, and a Next.js 14 frontend dashboard. No external API keys are needed — it uses public Polymarket APIs.
+The stack is Docker Compose with four services:
 
-See `README.md` and `SETUP.md` for standard setup instructions. See `.cursor/rules/` for detailed architecture rules.
+- PostgreSQL 16
+- Redis 7
+- Python 3.12 / FastAPI backend
+- Next.js 14 frontend dashboard
+
+No private API keys are required for normal local operation (public Polymarket APIs).
+
+See `README.md` and `SETUP.md` for setup flow. See `.cursor/rules/` for deep architecture and operations guidance.
 
 ### Service ports
 
-| Service   | Host Port | Container Port |
-|-----------|-----------|----------------|
-| Backend   | 8002      | 8000           |
-| Frontend  | 3002      | 3000           |
-| PostgreSQL| 5433      | 5432           |
-| Redis     | 6380      | 6379           |
+| Service    | Host Port | Container Port |
+|------------|-----------|----------------|
+| Backend    | 8002      | 8000           |
+| Frontend   | 3002      | 3000           |
+| PostgreSQL | 5433      | 5432           |
+| Redis      | 6380      | 6379           |
 
 ### Running services
 
 ```bash
-cp .env.example .env   # only needed once
+cp .env.example .env   # only once
 docker compose up --build -d
 ```
 
-The backend auto-runs `alembic upgrade head` and seed data on startup.
+Backend startup auto-runs `alembic upgrade head` and seed routines.
 
-### Nested container cgroup workaround
+### Nested container cgroup workaround (required in Cursor Cloud)
 
-The VM is itself a Docker container inside Firecracker. The `deploy.resources` limits in `docker-compose.yml` fail because cgroup v2 is in threaded mode. A `docker-compose.override.yml` that zeroes out resource limits is required. The override must also be present when `docker compose` commands are run. Do not delete `docker-compose.override.yml`.
+The VM itself runs inside a container. `deploy.resources` can fail under threaded cgroup v2 unless Docker daemon settings are adjusted. Keep `docker-compose.override.yml` in place and do not delete it.
 
-Before starting Docker, the daemon must be configured:
+Run once before `docker compose` if the daemon is not already configured:
 
 ```bash
 sudo mkdir -p /etc/docker
@@ -39,14 +54,29 @@ sudo dockerd &>/tmp/dockerd.log &
 sudo chmod 666 /var/run/docker.sock
 ```
 
-### Running tests
+### Testing guidance
 
-- **Backend (pytest):** `docker compose exec backend pytest tests/ -v` — 30 pure-computation tests (Kelly, Bayesian, spread, edge, Monte Carlo, Stoikov, book walker). No DB required.
-- **Frontend (lint):** `docker compose exec frontend npm run lint` — requires `eslint` and `eslint-config-next` as devDependencies and `.eslintrc.json` in the frontend directory.
+Prefer focused checks for touched areas instead of broad full-suite runs.
 
-### Key gotchas
+- Backend tests: `docker compose exec backend pytest tests/ -v`
+  - Current suite is mostly pure-computation strategy/math tests.
+- Frontend lint: `docker compose exec frontend npm run lint`
+  - Requires `eslint@8` and `eslint-config-next@14`.
 
-- ESLint is not included in the base `frontend/package.json`. You must install `eslint@8` and `eslint-config-next@14` for `npm run lint` to work (ESLint 9 is incompatible with Next.js 14).
-- The `.eslintrc.json` file (`{"extends": "next/core-web-vitals"}`) must exist in `/workspace/frontend/`.
-- The frontend volume mount in docker-compose.yml excludes `node_modules` and `.next` (they live in the container only). Packages installed inside the container are ephemeral; for persistent changes, update `package.json` and rebuild.
-- Backend code changes on a bind mount may not sync instantly. Use `docker cp` and pycache cleanup as described in `.cursor/rules/03-docker-deployment.mdc`.
+If UI behavior changes, perform manual browser validation in addition to terminal checks.
+
+### Development gotchas
+
+- Frontend container keeps its own `node_modules` and `.next`; container-only installs are ephemeral. Persist dependency changes in `frontend/package.json`.
+- `.eslintrc.json` should exist in `/workspace/frontend/` with:
+  - `{"extends": "next/core-web-vitals"}`
+- Backend bind mounts can lag in Docker Desktop / nested environments. If code appears stale, sync explicitly and clear bytecode:
+
+```bash
+docker cp backend/app/<path>.py kripto-bot-backend-1:/app/app/<path>.py
+docker exec kripto-bot-backend-1 sh -c "find /app -name '__pycache__' -type d | xargs rm -rf 2>/dev/null"
+```
+
+### Troubleshooting references
+
+For known production-like paper-trading failure patterns (signal generation, kill switch behavior, sizing, stale data exits, etc.), use `.cursor/rules/00-known-issues.mdc` as the primary diagnostic playbook.
