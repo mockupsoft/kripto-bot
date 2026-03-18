@@ -31,6 +31,7 @@ def _serialize_position(p: PaperPosition, market_question: str | None = None) ->
         "status": p.status,
         "exit_reason": p.exit_reason,
         "epoch": p.epoch,
+        "conviction_tier": p.conviction_tier,
         "opened_at": p.opened_at.isoformat() if p.opened_at else None,
         "closed_at": p.closed_at.isoformat() if p.closed_at else None,
         "target_structure": p.target_structure,
