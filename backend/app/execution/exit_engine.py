@@ -532,13 +532,44 @@ async def run_exit_cycle(db: AsyncSession) -> dict[str, Any]:
 
             # ── Layer B: No-progress exit ─────────────────────────────────
             # Trade has consumed significant lifetime without working.
+            # Winner protection: if the position shows signs of being a
+            # potential winner, delay the no_progress threshold.
 
-            # B1: >35% lifetime used and pnl is still flat or negative
-            if life_pct > 0.35 and pnl_pct < 0.01:
-                info = await close_position(db, pos, current_price, "no_progress")
-                closed.append(info)
-                already_closed_this_cycle.add(pos.id)
-                continue
+            # Detect potential winner signals
+            _wallet_aligned = False
+            if strategy in COPY_STRATEGIES and pos.source_wallet_id:
+                _wr = await db.execute(
+                    select(WalletTransaction)
+                    .where(
+                        WalletTransaction.wallet_id == pos.source_wallet_id,
+                        WalletTransaction.market_id == pos.market_id,
+                        WalletTransaction.occurred_at > pos.opened_at,
+                        WalletTransaction.side == (pos.side or "BUY"),
+                    )
+                    .limit(1)
+                )
+                _wallet_aligned = _wr.scalar_one_or_none() is not None
+
+            _edge_increased = await _check_ev_compression(db, pos, current_price, current_spread) is False
+            _potential_winner = (
+                pnl_pct > 0.003          # current pnl > +0.3%
+                or _wallet_aligned        # wallet still trading same direction
+            )
+
+            if _potential_winner:
+                # Protect: delay threshold by +20% lifetime, require deeper loss
+                if life_pct > 0.55 and pnl_pct < -0.005:
+                    info = await close_position(db, pos, current_price, "no_progress")
+                    closed.append(info)
+                    already_closed_this_cycle.add(pos.id)
+                    continue
+            else:
+                # Standard no_progress: >35% lifetime + pnl < 1%
+                if life_pct > 0.35 and pnl_pct < 0.01:
+                    info = await close_position(db, pos, current_price, "no_progress")
+                    closed.append(info)
+                    already_closed_this_cycle.add(pos.id)
+                    continue
 
             # ── Layer C: Time-decay exit ──────────────────────────────────
             # Tighten tolerance as market approaches resolution.
